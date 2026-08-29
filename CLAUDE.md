@@ -1,7 +1,21 @@
 # rbtree-lab: project rules
+## Build environment
+- The default `gcc` on this machine is 11.5.0, which does NOT accept the
+literal flag `-std=c23` (errors with "unrecognized command-line option").
+Only gcc 14+ accepts that exact spelling; gcc/15.2.0 and gcc/16.1.0 are
+available as modules and do. Do not "fix" this by changing the Makefile's
+`-std=c23` to `-std=c2x` — the spec requires `-std=c23` and the grading
+environment presumably has a compliant compiler.
+- Module loads do NOT persist between separate tool calls in this
+environment — each command runs in a fresh shell. Every command that
+invokes `make` or `gcc` for this project must load the module in that same
+command, e.g.:
+`module load gcc/15.2.0 && make test`
+Never run `make`/`gcc` bare and assume a prior module load carried over.
 ## Commands
-- Build & unit tests: ‘make test‘
-- Sanitizers: ‘make asan‘ Valgrind: ‘make memcheck‘
+- Build & unit tests: ‘module load gcc/15.2.0 && make test‘
+- Sanitizers: ‘module load gcc/15.2.0 && make asan‘
+Valgrind: ‘module load gcc/15.2.0 && make memcheck‘
 - A change is DONE only when all three pass. Always run them; show output.
 ## Hard constraints
 - NEVER modify include/rbtree.h. It is the graded contract.
