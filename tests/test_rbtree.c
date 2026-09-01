@@ -62,6 +62,30 @@ int main(void)
 
     rb_destroy(t2);
 
+    /* sorted insertion: without fixup this degenerates into a linked list.
+     * Validate and check size after every single insert (not just at the
+     * end) to localize a broken fixup at the exact bad insert, and spot-
+     * check early keys stay reachable via rb_find - a stale t->root after
+     * a root-level rotation could leave rb_validate passing on the
+     * (still internally well-formed) orphaned subtree while silently
+     * dropping nodes from the reachable tree. */
+    rbtree_t *t3 = rb_create(free);
+    assert(t3 != NULL);
+
+    char key[3];
+    for (int i = 0; i < 20; i++) {
+        assert(snprintf(key, sizeof key, "%02d", i) == 2);
+        assert(rb_insert(t3, key, make_int(i)) == 0);
+        assert(rb_validate(t3) == 0);
+        assert(rb_size(t3) == (size_t)(i + 1));
+    }
+    assert(*(int *)rb_find(t3, "00") == 0);
+    assert(*(int *)rb_find(t3, "01") == 1);
+    assert(*(int *)rb_find(t3, "10") == 10);
+    assert(*(int *)rb_find(t3, "19") == 19);
+
+    rb_destroy(t3);
+
     printf("all tests passed\n");
     return 0;
 }

@@ -54,6 +54,94 @@ static char *dup_key(const char *key)
     return copy;
 }
 
+static void rotate_left(rbtree_t *t, struct rb_node *x)
+{
+    struct rb_node *y = x->right;
+
+    x->right = y->left;
+    if (y->left != &t->nil) {
+        y->left->parent = x;
+    }
+
+    y->parent = x->parent;
+    if (x->parent == &t->nil) {
+        t->root = y;
+    } else if (x == x->parent->left) {
+        x->parent->left = y;
+    } else {
+        x->parent->right = y;
+    }
+
+    y->left = x;
+    x->parent = y;
+}
+
+static void rotate_right(rbtree_t *t, struct rb_node *x)
+{
+    struct rb_node *y = x->left;
+
+    x->left = y->right;
+    if (y->right != &t->nil) {
+        y->right->parent = x;
+    }
+
+    y->parent = x->parent;
+    if (x->parent == &t->nil) {
+        t->root = y;
+    } else if (x == x->parent->right) {
+        x->parent->right = y;
+    } else {
+        x->parent->left = y;
+    }
+
+    y->right = x;
+    x->parent = y;
+}
+
+static void insert_fixup(rbtree_t *t, struct rb_node *z)
+{
+    /* invariant: z is red; whenever z's parent is also red, z is the one
+     * remaining red-red violation, and z's grandparent is always well
+     * defined (a red parent can never be the root, since the root is
+     * always black at the top of each iteration) */
+    while (z->parent->color == RB_RED) {
+        if (z->parent == z->parent->parent->left) {
+            struct rb_node *y = z->parent->parent->right; /* uncle */
+            if (y->color == RB_RED) {
+                z->parent->color = RB_BLACK;
+                y->color = RB_BLACK;
+                z->parent->parent->color = RB_RED;
+                z = z->parent->parent;
+            } else {
+                if (z == z->parent->right) {
+                    z = z->parent;
+                    rotate_left(t, z);
+                }
+                z->parent->color = RB_BLACK;
+                z->parent->parent->color = RB_RED;
+                rotate_right(t, z->parent->parent);
+            }
+        } else {
+            struct rb_node *y = z->parent->parent->left; /* uncle */
+            if (y->color == RB_RED) {
+                z->parent->color = RB_BLACK;
+                y->color = RB_BLACK;
+                z->parent->parent->color = RB_RED;
+                z = z->parent->parent;
+            } else {
+                if (z == z->parent->left) {
+                    z = z->parent;
+                    rotate_right(t, z);
+                }
+                z->parent->color = RB_BLACK;
+                z->parent->parent->color = RB_RED;
+                rotate_left(t, z->parent->parent);
+            }
+        }
+    }
+    t->root->color = RB_BLACK;
+}
+
 int rb_insert(rbtree_t *t, const char *key, void *value)
 {
     struct rb_node *y = &t->nil;
@@ -102,6 +190,7 @@ int rb_insert(rbtree_t *t, const char *key, void *value)
         y->right = node;
     }
 
+    insert_fixup(t, node);
     t->size++;
     rc = 0;
 
@@ -113,9 +202,6 @@ cleanup:
     return rc;
 }
 
-/* Checks BST key ordering only; color/black-height invariants are not yet
- * checked here since insert-fixup (which is required to keep them true)
- * doesn't exist yet. */
 static int validate_order(const rbtree_t *t, const struct rb_node *node,
                            const char **last)
 {
@@ -132,10 +218,45 @@ static int validate_order(const rbtree_t *t, const struct rb_node *node,
     return validate_order(t, node->right, last);
 }
 
+/* Returns the subtree's black-height (nil counts as black), or -1 if a
+ * red-black invariant is violated anywhere below node: a red node with a
+ * red child, or the two children's black-heights disagreeing. -1
+ * propagates straight up through every ancestor once found. */
+static int black_height(const rbtree_t *t, const struct rb_node *node)
+{
+    if (node == &t->nil) {
+        return 1;
+    }
+    if (node->color == RB_RED &&
+        (node->left->color == RB_RED || node->right->color == RB_RED)) {
+        return -1;
+    }
+
+    int left_bh = black_height(t, node->left);
+    if (left_bh == -1) {
+        return -1;
+    }
+    int right_bh = black_height(t, node->right);
+    if (right_bh == -1 || right_bh != left_bh) {
+        return -1;
+    }
+
+    return left_bh + (node->color == RB_BLACK ? 1 : 0);
+}
+
 int rb_validate(const rbtree_t *t)
 {
     const char *last = NULL;
-    return validate_order(t, t->root, &last) ? 0 : -1;
+    if (!validate_order(t, t->root, &last)) {
+        return -1;
+    }
+    if (t->root != &t->nil && t->root->color != RB_BLACK) {
+        return -1;
+    }
+    if (t->root->parent != &t->nil) {
+        return -1;
+    }
+    return black_height(t, t->root) == -1 ? -1 : 0;
 }
 
 static void destroy_subtree(rbtree_t *t, struct rb_node *node)
@@ -159,6 +280,30 @@ void rb_destroy(rbtree_t *t)
     }
     destroy_subtree(t, t->root);
     free(t);
+}
+
+size_t rb_size(const rbtree_t *t)
+{
+    return t->size;
+}
+
+static void foreach_subtree(const rbtree_t *t, const struct rb_node *node,
+                             void (*fn)(const char *, void *, void *),
+                             void *ctx)
+{
+    if (node == &t->nil) {
+        return;
+    }
+    foreach_subtree(t, node->left, fn, ctx);
+    fn(node->key, node->value, ctx);
+    foreach_subtree(t, node->right, fn, ctx);
+}
+
+void rb_foreach(const rbtree_t *t,
+                void (*fn)(const char *key, void *value, void *ctx),
+                void *ctx)
+{
+    foreach_subtree(t, t->root, fn, ctx);
 }
 
 void *rb_find(const rbtree_t *t, const char *key)
