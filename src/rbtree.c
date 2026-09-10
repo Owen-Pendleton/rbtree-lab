@@ -202,6 +202,141 @@ cleanup:
     return rc;
 }
 
+static void transplant(rbtree_t *t, struct rb_node *u, struct rb_node *v)
+{
+    if (u->parent == &t->nil) {
+        t->root = v;
+    } else if (u == u->parent->left) {
+        u->parent->left = v;
+    } else {
+        u->parent->right = v;
+    }
+    v->parent = u->parent;
+}
+
+static struct rb_node *tree_minimum(rbtree_t *t, struct rb_node *x)
+{
+    /* invariant: the minimum of the subtree rooted at x lies in the
+     * subtree rooted at x; each step through left narrows that subtree */
+    while (x->left != &t->nil) {
+        x = x->left;
+    }
+    return x;
+}
+
+static void delete_fixup(rbtree_t *t, struct rb_node *x)
+{
+    /* invariant: x carries an extra "phantom" black unit relative to its
+     * sibling's subtree; the loop pushes that extra black up the tree,
+     * recoloring or rotating until it can be absorbed without changing any
+     * black-height */
+    while (x != t->root && x->color == RB_BLACK) {
+        if (x == x->parent->left) {
+            struct rb_node *w = x->parent->right; /* sibling */
+            if (w->color == RB_RED) {
+                w->color = RB_BLACK;
+                x->parent->color = RB_RED;
+                rotate_left(t, x->parent);
+                w = x->parent->right;
+            }
+            if (w->left->color == RB_BLACK && w->right->color == RB_BLACK) {
+                w->color = RB_RED;
+                x = x->parent;
+            } else {
+                if (w->right->color == RB_BLACK) {
+                    w->left->color = RB_BLACK;
+                    w->color = RB_RED;
+                    rotate_right(t, w);
+                    w = x->parent->right;
+                }
+                w->color = x->parent->color;
+                x->parent->color = RB_BLACK;
+                w->right->color = RB_BLACK;
+                rotate_left(t, x->parent);
+                x = t->root;
+            }
+        } else {
+            /* mirror image of the if-branch, left/right swapped */
+            struct rb_node *w = x->parent->left; /* sibling */
+            if (w->color == RB_RED) {
+                w->color = RB_BLACK;
+                x->parent->color = RB_RED;
+                rotate_right(t, x->parent);
+                w = x->parent->left;
+            }
+            if (w->right->color == RB_BLACK && w->left->color == RB_BLACK) {
+                w->color = RB_RED;
+                x = x->parent;
+            } else {
+                if (w->left->color == RB_BLACK) {
+                    w->right->color = RB_BLACK;
+                    w->color = RB_RED;
+                    rotate_left(t, w);
+                    w = x->parent->left;
+                }
+                w->color = x->parent->color;
+                x->parent->color = RB_BLACK;
+                w->left->color = RB_BLACK;
+                rotate_right(t, x->parent);
+                x = t->root;
+            }
+        }
+    }
+    x->color = RB_BLACK;
+}
+
+int rb_delete(rbtree_t *t, const char *key)
+{
+    struct rb_node *z = t->root;
+
+    /* invariant: if key is in the tree, it is in the subtree rooted at z */
+    while (z != &t->nil) {
+        int cmp = strcmp(key, z->key);
+        if (cmp == 0) {
+            break;
+        }
+        z = (cmp < 0) ? z->left : z->right;
+    }
+    if (z == &t->nil) {
+        return -1;
+    }
+
+    if (z->left != &t->nil && z->right != &t->nil) {
+        /* two-children reduction: hoist the successor's key/value into z by
+         * swapping, then delete the successor instead - it has at most one
+         * child by construction (it's a subtree minimum) */
+        struct rb_node *y = tree_minimum(t, z->right);
+
+        char *tmp_key = z->key;
+        z->key = y->key;
+        y->key = tmp_key;
+
+        void *tmp_value = z->value;
+        z->value = y->value;
+        y->value = tmp_value;
+
+        z = y;
+    }
+
+    /* one-child splice: z now has at most one child, whether it started
+     * that way or was just reduced to it above */
+    struct rb_node *x = (z->left != &t->nil) ? z->left : z->right;
+    transplant(t, z, x);
+    rb_color_t removed_color = z->color;
+
+    if (removed_color == RB_BLACK) {
+        delete_fixup(t, x);
+    }
+
+    if (t->value_free) {
+        t->value_free(z->value);
+    }
+    free(z->key);
+    free(z);
+    t->size--;
+    return 0;
+}
+
 static int validate_order(const rbtree_t *t, const struct rb_node *node,
                            const char **last)
 {

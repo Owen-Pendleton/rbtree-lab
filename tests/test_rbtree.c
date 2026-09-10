@@ -20,6 +20,44 @@ static int *make_int(int n)
     return p;
 }
 
+typedef struct {
+    const char *name;
+    const char *inserts[8];
+    size_t      n_inserts;
+    const char *delete_key;
+    size_t      expect_size_after;
+} delete_case_t;
+
+static const delete_case_t delete_cases[] = {
+    { "red leaf",
+      {"10","20","30"}, 3, "10", 2 },
+    { "black leaf, red sibling",
+      {"61","06","40","91","79","76"}, 6, "06", 5 },
+    { "node with two children",
+      {"50","30","70","20","40"}, 5, "30", 4 },
+    { "root deletion",
+      {"50","30"}, 2, "50", 1 },
+    { "black node, single red child",
+      {"61","06","40","91","79","76"}, 6, "61", 5 },
+};
+
+static void test_delete_cases(void)
+{
+    for (size_t i = 0; i < sizeof delete_cases / sizeof delete_cases[0]; i++) {
+        const delete_case_t *c = &delete_cases[i];
+        rbtree_t *t = rb_create(free);
+        assert(t != NULL);
+        for (size_t j = 0; j < c->n_inserts; j++) {
+            assert(rb_insert(t, c->inserts[j], make_int((int)j)) == 0);
+        }
+        assert(rb_delete(t, c->delete_key) == 0);
+        assert(rb_validate(t) == 0);
+        assert(rb_size(t) == c->expect_size_after);
+        assert(rb_find(t, c->delete_key) == NULL);
+        rb_destroy(t);
+    }
+}
+
 int main(void)
 {
     rb_destroy(NULL); /* must not crash */
@@ -85,6 +123,8 @@ int main(void)
     assert(*(int *)rb_find(t3, "19") == 19);
 
     rb_destroy(t3);
+
+    test_delete_cases();
 
     printf("all tests passed\n");
     return 0;
