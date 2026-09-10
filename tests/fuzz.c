@@ -63,50 +63,109 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* invariant: keys are drawn from a space twice the insert count, so
-     * collisions (and thus rb_insert's overwrite path) happen often */
+    /* invariant: keys are drawn from a space twice the operation count, so
+     * both rb_insert's overwrite path and rb_delete's absent-key path fire
+     * often; ops are biased toward insert so the tree has room to grow
+     * before delete gets much chance to shrink it back down. model_count is
+     * maintained incrementally so it stays cheap to compare against
+     * rb_size(t) after every single operation, not just at the end. */
+    long model_count      = 0;
+    long validate_interval = (n / 200 < 1) ? 1 : n / 200;
     for (long i = 0; i < n; i++) {
         long num = rand() % (n * 2);
         char key[32];
         snprintf(key, sizeof key, "k%ld", num);
 
-        int *value = malloc(sizeof *value);
-        if (!value) {
-            fprintf(stderr, "malloc failed at i=%ld\n", i);
+        bool do_insert = (rand() % 100) < 60;
+
+        if (do_insert) {
+            int *value = malloc(sizeof *value);
+            if (!value) {
+                fprintf(stderr, "malloc failed at i=%ld\n", i);
+                rb_destroy(t);
+                free(model.present);
+                free(model.value);
+                return 1;
+            }
+            *value = (int)i;
+
+            if (rb_insert(t, key, value) != 0) {
+                fprintf(stderr, "rb_insert failed at i=%ld\n", i);
+                free(value);
+                rb_destroy(t);
+                free(model.present);
+                free(model.value);
+                return 1;
+            }
+
+            if (!model.present[num]) {
+                model_count++;
+            }
+            model.present[num] = true;
+            model.value[num]   = (int)i;
+        } else {
+            int  rc              = rb_delete(t, key);
+            bool expected_present = model.present[num];
+
+            if ((rc == 0) != expected_present) {
+                fprintf(stderr,
+                        "rb_delete mismatch at i=%ld, %s: rc=%d expected_present=%d\n",
+                        i, key, rc, expected_present);
+                rb_destroy(t);
+                free(model.present);
+                free(model.value);
+                return 1;
+            }
+            if (rc == 0) {
+                model.present[num] = false;
+                model_count--;
+            }
+        }
+
+        /* rb_validate walks the whole tree, so calling it every iteration
+         * would make this loop O(n^2); check at a fixed number of
+         * checkpoints spread across the run instead, trading exact
+         * localization for staying linear in n at fuzz scale */
+        if (i % validate_interval == 0 && rb_validate(t) != 0) {
+            fprintf(stderr, "rb_validate failed at i=%ld: invariants broken\n", i);
             rb_destroy(t);
             free(model.present);
             free(model.value);
             return 1;
         }
-        *value = (int)i;
-
-        if (rb_insert(t, key, value) != 0) {
-            fprintf(stderr, "rb_insert failed at i=%ld\n", i);
-            free(value);
+        if (rb_size(t) != (size_t)model_count) {
+            fprintf(stderr, "rb_size mismatch at i=%ld: rb_size=%zu model=%ld\n",
+                    i, rb_size(t), model_count);
             rb_destroy(t);
             free(model.present);
             free(model.value);
             return 1;
         }
-
-        model.present[num] = true;
-        model.value[num]   = (int)i;
     }
 
     if (rb_validate(t) != 0) {
-        fprintf(stderr, "rb_validate failed: invariants broken\n");
+        fprintf(stderr, "rb_validate failed: invariants broken at final state\n");
         rb_destroy(t);
         free(model.present);
         free(model.value);
         return 1;
     }
 
-    /* invariant: model_count sums every present slot exactly once */
-    long model_count = 0;
+    /* invariant: recount from scratch as a cross-check against model_count,
+     * which was maintained incrementally through every insert/delete above */
+    long recount = 0;
     for (long num = 0; num < n * 2; num++) {
         if (model.present[num]) {
-            model_count++;
+            recount++;
         }
+    }
+    if (recount != model_count) {
+        fprintf(stderr, "model bookkeeping mismatch: recount=%ld running=%ld\n",
+                recount, model_count);
+        rb_destroy(t);
+        free(model.present);
+        free(model.value);
+        return 1;
     }
 
     struct foreach_ctx ctx = {.model = &model, .ok = true};

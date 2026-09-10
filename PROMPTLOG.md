@@ -59,3 +59,14 @@ before any code was written. Repeated per function rather than all at once.
 **Verification:** `make test`, `make asan`, and `make memcheck` all pass
 clean — Valgrind reports 0 errors and all heap blocks freed on both the
 unit tests and the fuzz driver.
+
+
+Changes I made when implementing the deletion sections:
+
+A missing required test case. The notes add a 5th case to Milestone 2's list: a black node with a single red child, tested specifically to confirm the code doesn't enter the sibling-case loop — x is red, the loop condition (x != root && x->color == BLACK) is false immediately, and the fixup's tail (x->color = BLACK) settles it in one line. My "root deletion" test (50,30, delete "50") technically exercises this, but only as a root, which the spec treats as a separate case — they want it shown as its own scenario, presumably including a non-root instance.
+
+Good news: I already have a verified non-root instance sitting in the tree from test case 2. Recall the shape from 61,06,40,91,79,76:
+40(B)[ 06(B) leaf, 79(R)[ 61(B)[nil, 76(R) leaf], 91(B) leaf ] ]
+61 is black with exactly one child, 76, which is red — non-root, and not the node case 2 deletes. Deleting "61" from that same insert sequence gives x = 76 (red), removed_color = BLACK, and fixup's loop must not fire. That's a clean 5th table row reusing an insert sequence we've already validated, no new simulation needed.
+
+One bug I introduced and fixed along the way, worth flagging since it's the kind of thing that bites people in this class too: I initially validated the whole tree (rb_validate, an O(n) walk) after every single operation, which turned the fuzz loop into O(n²). It passed fine at n=100000 (just slow enough not to notice) but hung past n=200000. Fixed by checking rb_size (O(1)) every iteration, and rb_validate at ~200 checkpoints spread across the run plus once at the end — enough to still localize a broken invariant to roughly the right region, without losing linear scaling. Reran at n=1, 2, 5, and 500000 to confirm — 500000 now finishes in ~2s..
