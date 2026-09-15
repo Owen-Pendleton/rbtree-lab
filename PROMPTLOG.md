@@ -70,3 +70,50 @@ Good news: I already have a verified non-root instance sitting in the tree from 
 61 is black with exactly one child, 76, which is red — non-root, and not the node case 2 deletes. Deleting "61" from that same insert sequence gives x = 76 (red), removed_color = BLACK, and fixup's loop must not fire. That's a clean 5th table row reusing an insert sequence we've already validated, no new simulation needed.
 
 One bug I introduced and fixed along the way, worth flagging since it's the kind of thing that bites people in this class too: I initially validated the whole tree (rb_validate, an O(n) walk) after every single operation, which turned the fuzz loop into O(n²). It passed fine at n=100000 (just slow enough not to notice) but hung past n=200000. Fixed by checking rb_size (O(1)) every iteration, and rb_validate at ~200 checkpoints spread across the run plus once at the end — enough to still localize a broken invariant to roughly the right region, without losing linear scaling. Reran at n=1, 2, 5, and 500000 to confirm — 500000 now finishes in ~2s..
+
+## 2026-09-14 — Evening 3
+
+**Scope:** double-black case table for `delete_fixup` (one isolated unit
+test per branch, mirrors included), plus fuzzer hardening: fixed seed,
+configurable validate cadence, and an automatic shrink-on-failure pass.
+
+**Finding coverage was thinner than it looked:** traced all 5 existing
+`delete_cases[]` rows by hand before adding anything. Only "black leaf, red
+sibling" actually drove `delete_fixup`'s sibling-rebalancing loop at all
+(and it chains sibling-red straight into far-red-nephew, rather than
+isolating one branch) — the other 4 rows exercise red-leaf removal,
+two-children swap, and the two "loop never runs" terminal cases, none of
+which touch the sibling-based cases. Rather than hand-derive 7 more tree
+shapes by arithmetic (error-prone), built a throwaway instrumented copy of
+`rbtree.c` in scratch (one case-id tag per branch) and brute-force searched
+small insert/delete sequences until each of the 8 branches (A1-A4, and
+their B1-B4 mirrors for x being the right child) had a minimal example,
+replayed deterministically and dumped for review before writing anything.
+Confirmed by construction that A1/A3 (and mirrors B1/B3) can never fire
+alone — the code always falls through into a terminal case (2 or 4; 6 or 8)
+within the same `delete_fixup` call — so those four rows are documented as
+minimal 2-branch chains rather than forced isolations. `delete_cases[]` now
+has 12 rows; `make test` green.
+
+**Fuzzer changes (`tests/fuzz.c`):** it never called `srand()` at all
+before tonight (silently defaulting to glibc's implicit seed) — added
+`argv[2]` as an optional seed, default `1337`, documented here and in the
+success/failure output so a run is citable. Added `argv[3]` as an optional
+`rb_validate` cadence override (default stays today's `n/200` so `make
+test`/`asan`/`memcheck` are unaffected). Biggest addition: on any mismatch,
+the fuzzer now logs every operation's decision as it's drawn from `rand()`
+and, on failure, runs a delta-debugging (ddmin) pass that replays reduced
+candidate sequences against a fresh tree/model until no operation can be
+dropped without the failure disappearing — so a failure prints an
+already-minimized repro instead of a multi-thousand-line log.
+
+**Verification:** `make test`, `make asan`, `make memcheck` all green.
+Additionally ran the fuzzer directly (not through the Makefile, since the
+params are non-default) at 100,000 ops / seed 1337 / validate-every-100
+under both an ASan build and Valgrind — both clean, no bug found at this
+seed. Since a clean run means the shrink path never actually fires, tested
+it separately: patched a throwaway scratch copy of `rbtree.c` to skip one
+recolor in case A4, ran the real (unmodified) fuzzer against it, and
+confirmed it caught the broken invariant at op 2401/100000 and shrank the
+repro down to 11 operations. `src/rbtree.c` itself was not touched this
+session.

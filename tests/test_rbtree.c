@@ -31,6 +31,10 @@ typedef struct {
 static const delete_case_t delete_cases[] = {
     { "red leaf",
       {"10","20","30"}, 3, "10", 2 },
+    /* double-black case 1 (sibling red, x left child): the rotation this
+     * branch does always falls straight through into another case in the
+     * same delete_fixup call - here, case 4 (far red nephew) - since the
+     * loop never revisits case 1 within one call. */
     { "black leaf, red sibling",
       {"61","06","40","91","79","76"}, 6, "06", 5 },
     { "node with two children",
@@ -39,6 +43,37 @@ static const delete_case_t delete_cases[] = {
       {"50","30"}, 2, "50", 1 },
     { "black node, single red child",
       {"61","06","40","91","79","76"}, 6, "61", 5 },
+    /* double-black case 2 (x left child, sibling black, both nephews
+     * black): pure recolor-and-climb, isolated with no other branch
+     * firing in this delete_fixup call. */
+    { "double-black: sibling black, nephews black (left)",
+      {"12","14","06","00","02","04","09","08"}, 8, "00", 7 },
+    /* double-black case 3 (x left child, sibling black, near nephew red):
+     * always falls through into case 4 immediately - case 3 can never
+     * fire alone. */
+    { "double-black: near-red nephew rotates to far-red (left)",
+      {"07","03","13","08"}, 4, "03", 3 },
+    /* double-black case 4 (x left child, sibling black, far nephew red),
+     * isolated: the far-red nephew is already in place, no case-3
+     * rotation needed first. */
+    { "double-black: far-red nephew (left)",
+      {"05","12","07","13"}, 4, "05", 3 },
+    /* mirror image of case 1: sibling red, x right child. Chains into
+     * case 2 here (both nephews black after the rotation), rather than
+     * case 4 - which follow-up case fires depends on the resulting
+     * sibling's shape, not on which side x is on. */
+    { "double-black: red sibling (right, mirror)",
+      {"15","12","08","05","02","01"}, 6, "12", 5 },
+    /* mirror of case 2: sibling black, both nephews black, isolated. */
+    { "double-black: sibling black, nephews black (right, mirror)",
+      {"01","02","00","14","10","03","07","05"}, 8, "01", 7 },
+    /* mirror of case 3: near-red nephew, always falls through to the
+     * mirrored case 4. */
+    { "double-black: near-red nephew rotates to far-red (right, mirror)",
+      {"01","14","12","11"}, 4, "12", 3 },
+    /* mirror of case 4: far-red nephew, isolated. */
+    { "double-black: far-red nephew (right, mirror)",
+      {"07","06","04","01"}, 4, "07", 3 },
 };
 
 static void test_delete_cases(void)
