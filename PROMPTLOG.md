@@ -117,3 +117,70 @@ recolor in case A4, ran the real (unmodified) fuzzer against it, and
 confirmed it caught the broken invariant at op 2401/100000 and shrank the
 repro down to 11 operations. `src/rbtree.c` itself was not touched this
 session.
+
+## 2026-09-14 — Adversarial review
+
+**Scope:** an adversarial review hunting three named bug families in
+`src/rbtree.c`: a use-after-free in the successor splice during deletion, a
+key copy leaked on the overwrite-existing-key path of insertion, and an
+allocation whose NULL return nobody checks. Traced each by hand first, then
+verified the two non-obvious conclusions empirically with throwaway mutated
+copies in scratch (same methodology as Evening 3's fuzzer-hardening test) —
+never touching `src/rbtree.c`, `tests/`, or `include/rbtree.h`.
+
+**False positive — UAF in the successor splice (`rb_delete`,
+`rbtree.c:288-338`):** this shape is a classic UAF trap in the textbook
+pointer-relinking delete (splice the successor node into `z`'s tree
+position, then read stale fields off the old `z`/`y` afterward), so it was
+the first thing I checked. But this implementation doesn't relink pointers —
+it swaps `key`/`value` *by value* between `z` and its successor `y`
+(`:310-316`), then reassigns `z = y` (`:318`) so the node that actually gets
+unlinked and freed is the one already destined for it. Tracing reads vs.
+frees: `transplant` at `:324` only rewires parent/child pointers, never
+calls `free`; `z->color` is read at `:325`, right after `transplant` but
+before any free; `delete_fixup` (`:327-328`) operates on `x` and its
+ancestors only, never touches `z`. The actual frees
+(`t->value_free(z->value)`, `free(z->key)`, `free(z)`) don't happen until
+`:331-335`, after every read of `z` completes. To confirm the shape really
+is dangerous in general (not just theoretically), I mutated a scratch copy
+to move the frees up before the `z->color` read and ran it under ASan
+against the real `test_rbtree.c`: it reliably aborts with
+`AddressSanitizer: heap-use-after-free ... READ of size 4` at the mutated
+`z->color` line, with the free and the original allocation both captured in
+the report. So the pattern is a legitimate thing to check — this code just
+avoids it by construction.
+
+**Real finding — coverage gap on the overwrite path (`rb_insert`,
+`rbtree.c:154-160`):** on `cmp == 0`, the code frees the old *value* via
+`value_free` (`:156-157`) and stores the new value (`:159`), but never
+touches `x->key` and never calls `dup_key()` here — since the key already
+matched, reusing the existing copy is correct, so nothing is allocated and
+nothing can leak on this path today. The gap is in verification, not
+behavior: `tests/test_rbtree.c:114-118` is the only test exercising this
+branch, and it asserts solely on `free_count` (the value's free-counter,
+via `counting_free`) — nothing in the suite asserts anything about the key
+copy. I proved this empirically: mutated a scratch copy to add a spurious
+`dup_key()` refresh inside the `cmp == 0` branch that overwrites `x->key`
+without freeing the old one, then ran the real, unmodified
+`tests/test_rbtree.c` against it — `all tests passed`, exit code 0, every
+assertion green, leak and all. Only `valgrind --leak-check=full` against
+that same mutant caught it (`6 bytes in 1 blocks are definitely lost ...
+by dup_key ... by rb_insert`). So the family-2 contract clause
+(`rbtree.h:11`) is correctly implemented, but it has exactly one layer of
+defense — Valgrind — rather than two; a dedicated assertion on key-copy
+identity/count in the overwrite test would close the gap without changing
+any production code.
+
+**Family 3 — unchecked allocation:** no finding. Every `malloc` site in
+`src/rbtree.c` (`rb_create` at `:27`, `dup_key` at `:49`, `rb_insert`'s
+`node` at `:169` and `key_copy` at `:173`) is checked on the very next
+line, and `rb_insert`'s `goto cleanup` (`:197-201`) frees exactly what
+succeeded and returns `-1` without mutating the tree, matching
+`rbtree.h:12-13`'s contract exactly.
+
+**Verification:** `make test`, `make asan`, `make memcheck` all green on the
+untouched tree (0 leaks, 0 sanitizer errors, 33,194+270 allocs all freed).
+Both mutation experiments ran only against scratch copies of `rbtree.c` and
+the real, unmodified `tests/test_rbtree.c` — nothing under `src/`, `tests/`,
+or `include/` was changed by this session. `git status`/`git diff` after
+this entry shows only `PROMPTLOG.md` touched.
