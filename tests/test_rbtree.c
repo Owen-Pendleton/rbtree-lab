@@ -1,4 +1,5 @@
 #include "rbtree.h"
+#include "fault_alloc.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -215,6 +216,168 @@ static void test_long_keys(void)
     free(near_dup);
 }
 
+enum { N_KEYS = 200, N_DELETE = 100, N_OVERWRITE = 50, MAX_SWEEP = 100000 };
+enum { KEY_CAP = 16 };
+
+/* shadow model: what the tree must contain right now */
+static bool present[N_KEYS];
+static int  expect[N_KEYS];
+
+static void make_key(char buf[KEY_CAP], int i)
+{
+    snprintf(buf, KEY_CAP, "%03d", i);
+}
+
+struct walk {
+    int    next;    /* lowest model index not yet accounted for */
+    size_t matched; /* entries seen so far */
+};
+
+static void check_entry(const char *key, void *value, void *ctx)
+{
+    struct walk *w = ctx;
+
+    /* invariant: every model index below w->next is absent or matched */
+    while (w->next < N_KEYS && !present[w->next]) {
+        w->next++;
+    }
+    assert(w->next < N_KEYS);
+
+    char want[KEY_CAP];
+    make_key(want, w->next);
+    assert(strcmp(key, want) == 0);
+    assert(*(int *)value == expect[w->next]);
+
+    w->next++;
+    w->matched++;
+}
+
+/* The tree must be a valid red-black tree holding exactly the model. */
+static void check_tree(const rbtree_t *t)
+{
+    assert(rb_validate(t) == 0);
+
+    size_t n = 0;
+    for (int i = 0; i < N_KEYS; i++) {
+        n += present[i] ? 1 : 0;
+    }
+    assert(rb_size(t) == n);
+
+    struct walk w = { 0, 0 };
+    rb_foreach(t, check_entry, &w);
+    assert(w.matched == n);
+}
+
+/* fault_alloc_total() value at which the armed fault fires */
+static long fire_at;
+
+/* Did the armed fault fire since `before` was read? */
+static bool fault_hit(long before)
+{
+    return before < fire_at && fault_alloc_total() >= fire_at;
+}
+
+/* Insert (or overwrite) key i with value v. Returns whether this call hit
+ * the fault. */
+static bool try_insert(rbtree_t *t, int i, int v)
+{
+    char key[KEY_CAP];
+    make_key(key, i);
+
+    int *p = malloc(sizeof *p);
+    assert(p != NULL);
+    *p = v;
+
+    long before = fault_alloc_total();
+    int rc = rb_insert(t, key, p);
+    bool hit = fault_hit(before);
+
+    if (hit) {
+        assert(rc == -1);
+        free(p); /* not consumed: the caller still owns the value */
+    } else {
+        assert(rc == 0);
+        present[i] = true;
+        expect[i] = v;
+    }
+    check_tree(t);
+    return hit;
+}
+
+/* Delete key i, which may be absent if its insert was the one that failed.
+ * Returns whether this call hit the fault. */
+static bool try_delete(rbtree_t *t, int i)
+{
+    char key[KEY_CAP];
+    make_key(key, i);
+
+    long before = fault_alloc_total();
+    int rc = rb_delete(t, key);
+    bool hit = fault_hit(before);
+
+    assert(rc == (present[i] ? 0 : -1));
+    present[i] = false;
+    check_tree(t);
+    return hit;
+}
+
+/* The i-th key of the scenario. 37 shares no factor with N_KEYS, so
+ * i = 0..N_KEYS-1 visits every key exactly once, in scrambled order. */
+static int scenario_key(int i)
+{
+    return (i * 37) % N_KEYS;
+}
+
+/* One run: insert N_KEYS keys, delete N_DELETE, overwrite N_OVERWRITE, with
+ * the n-th allocation failing. Returns whether the fault was hit. */
+static bool run_scenario(long n)
+{
+    bool hit = false;
+    memset(present, 0, sizeof present);
+
+    fire_at = fault_alloc_total() + n;
+    fault_alloc_arm(n);
+
+    long before = fault_alloc_total();
+    rbtree_t *t = rb_create(free);
+    if (fault_hit(before)) {
+        assert(t == NULL);
+        fault_alloc_disarm();
+        return true;
+    }
+    assert(t != NULL);
+    check_tree(t);
+
+    for (int i = 0; i < N_KEYS; i++) {
+        int k = scenario_key(i);
+        hit |= try_insert(t, k, k);
+    }
+    for (int i = 0; i < N_DELETE; i++) {
+        hit |= try_delete(t, scenario_key(i));
+    }
+    for (int i = N_DELETE; i < N_DELETE + N_OVERWRITE; i++) {
+        int k = scenario_key(i);
+        hit |= try_insert(t, k, k + 1000);
+    }
+
+    fault_alloc_disarm();
+    rb_destroy(t);
+    return hit;
+}
+
+static void test_fault_sweep(void)
+{
+    long n = 1;
+
+    /* invariant: every run with a fault index below n hit its fault */
+    while (run_scenario(n)) {
+        n++;
+        assert(n < MAX_SWEEP);
+    }
+
+    printf("fault sweep passed: %ld faulted runs, clean at n=%ld\n", n - 1, n);
+}
+
 int main(void)
 {
     rb_destroy(NULL); /* must not crash */
@@ -286,6 +449,7 @@ int main(void)
     test_single_node();
     test_overwrite_only_key();
     test_long_keys();
+    test_fault_sweep();
 
     printf("all tests passed\n");
     return 0;
