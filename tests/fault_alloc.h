@@ -11,4 +11,6 @@ void fault_alloc_arm(long n);
 void fault_alloc_disarm(void);
 /* allocations observed so far */
 long fault_alloc_total(void);
+/* allocations currently outstanding (handed out, not yet freed) */
+long fault_alloc_live(void);
 #endif

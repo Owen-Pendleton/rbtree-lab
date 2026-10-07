@@ -289,14 +289,18 @@ static bool try_insert(rbtree_t *t, int i, int v)
     *p = v;
 
     long before = fault_alloc_total();
+    int frees_before = free_count;
     int rc = rb_insert(t, key, p);
     bool hit = fault_hit(before);
 
     if (hit) {
         assert(rc == -1);
+        assert(free_count == frees_before); /* value not consumed */
         free(p); /* not consumed: the caller still owns the value */
     } else {
         assert(rc == 0);
+        /* an overwrite frees the old value once; a new key frees nothing */
+        assert(free_count == frees_before + (present[i] ? 1 : 0));
         present[i] = true;
         expect[i] = v;
     }
@@ -312,10 +316,12 @@ static bool try_delete(rbtree_t *t, int i)
     make_key(key, i);
 
     long before = fault_alloc_total();
+    int frees_before = free_count;
     int rc = rb_delete(t, key);
     bool hit = fault_hit(before);
 
     assert(rc == (present[i] ? 0 : -1));
+    assert(free_count == frees_before + (present[i] ? 1 : 0));
     present[i] = false;
     check_tree(t);
     return hit;
@@ -333,16 +339,18 @@ static int scenario_key(int i)
 static bool run_scenario(long n)
 {
     bool hit = false;
+    long live_before = fault_alloc_live();
     memset(present, 0, sizeof present);
 
     fire_at = fault_alloc_total() + n;
     fault_alloc_arm(n);
 
     long before = fault_alloc_total();
-    rbtree_t *t = rb_create(free);
+    rbtree_t *t = rb_create(counting_free);
     if (fault_hit(before)) {
         assert(t == NULL);
         fault_alloc_disarm();
+        assert(fault_alloc_live() == live_before);
         return true;
     }
     assert(t != NULL);
@@ -361,7 +369,11 @@ static bool run_scenario(long n)
     }
 
     fault_alloc_disarm();
+    int frees_before = free_count;
+    int remaining = (int)rb_size(t);
     rb_destroy(t);
+    assert(free_count == frees_before + remaining); /* one free per entry */
+    assert(fault_alloc_live() == live_before); /* nothing leaked this run */
     return hit;
 }
 
@@ -371,6 +383,8 @@ static void test_fault_sweep(void)
 
     /* invariant: every run with a fault index below n hit its fault */
     while (run_scenario(n)) {
+        printf("sweep n=%ld: faulted, ok\n", n);
+        fflush(stdout); /* keep the line if a later assert aborts */
         n++;
         assert(n < MAX_SWEEP);
     }
