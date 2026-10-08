@@ -288,10 +288,17 @@ static bool try_insert(rbtree_t *t, int i, int v)
     assert(p != NULL);
     *p = v;
 
+    bool overwrite = present[i];
+
     long before = fault_alloc_total();
     int frees_before = free_count;
     int rc = rb_insert(t, key, p);
     bool hit = fault_hit(before);
+
+    /* an overwrite reuses the node and key copy the tree already owns */
+    if (overwrite) {
+        assert(fault_alloc_total() == before);
+    }
 
     if (hit) {
         assert(rc == -1);
@@ -308,9 +315,8 @@ static bool try_insert(rbtree_t *t, int i, int v)
     return hit;
 }
 
-/* Delete key i, which may be absent if its insert was the one that failed.
- * Returns whether this call hit the fault. */
-static bool try_delete(rbtree_t *t, int i)
+/* Delete key i, which may be absent if its insert was the one that failed. */
+static void try_delete(rbtree_t *t, int i)
 {
     char key[KEY_CAP];
     make_key(key, i);
@@ -318,13 +324,15 @@ static bool try_delete(rbtree_t *t, int i)
     long before = fault_alloc_total();
     int frees_before = free_count;
     int rc = rb_delete(t, key);
-    bool hit = fault_hit(before);
+
+    /* delete has no error code for a failed allocation, so it may not
+     * allocate at all */
+    assert(fault_alloc_total() == before);
 
     assert(rc == (present[i] ? 0 : -1));
     assert(free_count == frees_before + (present[i] ? 1 : 0));
     present[i] = false;
     check_tree(t);
-    return hit;
 }
 
 /* The i-th key of the scenario. 37 shares no factor with N_KEYS, so
@@ -334,8 +342,9 @@ static int scenario_key(int i)
     return (i * 37) % N_KEYS;
 }
 
-/* One run: insert N_KEYS keys, delete N_DELETE, overwrite N_OVERWRITE, with
- * the n-th allocation failing. Returns whether the fault was hit. */
+/* One run: insert N_KEYS keys, delete N_DELETE, overwrite N_OVERWRITE, then
+ * re-insert the N_DELETE deleted keys, with the n-th allocation failing.
+ * Returns whether the fault was hit. */
 static bool run_scenario(long n)
 {
     bool hit = false;
@@ -361,11 +370,17 @@ static bool run_scenario(long n)
         hit |= try_insert(t, k, k);
     }
     for (int i = 0; i < N_DELETE; i++) {
-        hit |= try_delete(t, scenario_key(i));
+        try_delete(t, scenario_key(i));
     }
     for (int i = N_DELETE; i < N_DELETE + N_OVERWRITE; i++) {
         int k = scenario_key(i);
         hit |= try_insert(t, k, k + 1000);
+    }
+    /* invariant: keys scenario_key(0..i-1) are back in the tree unless
+     * their re-insert was the one that faulted */
+    for (int i = 0; i < N_DELETE; i++) {
+        int k = scenario_key(i);
+        hit |= try_insert(t, k, k + 2000);
     }
 
     fault_alloc_disarm();
