@@ -1,7 +1,9 @@
 #include "rbtree.h"
 #include "fault_alloc.h"
+#include "../src/pool.h"
 
 #include <assert.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -407,6 +409,70 @@ static void test_fault_sweep(void)
     printf("fault sweep passed: %ld faulted runs, clean at n=%ld\n", n - 1, n);
 }
 
+typedef struct {
+    size_t obj_size;
+    int    expect_rc;
+    size_t stride;
+    size_t slots;
+    size_t first_off;
+} geom_case_t;
+
+/* Hand-computed for a 4096-byte slab, 16-byte max alignment and 8-byte
+ * pointers: 16 bytes of header, 4080 bytes of room. */
+static const geom_case_t geom_cases[] = {
+    { 0,        -1, 0,    0,   0  },
+    { 1,         0, 16,   255, 16 }, /* grown to hold the link */
+    { 8,         0, 16,   255, 16 },
+    { 16,        0, 16,   255, 16 },
+    { 17,        0, 32,   127, 16 }, /* 4080 / 32 = 127.5 */
+    { 48,        0, 48,   85,  16 }, /* struct rb_node; 85 * 48 = 4080 */
+    { 49,        0, 64,   63,  16 },
+    { 4080,      0, 4080, 1,   16 }, /* largest that fits */
+    { 4081,     -1, 0,    0,   0  },
+    { SIZE_MAX, -1, 0,    0,   0  }, /* must not overflow in rounding */
+};
+
+static void test_pool_geometry(void)
+{
+    const size_t align = alignof(max_align_t);
+    const struct pool_geom untouched = { 7, 7, 7, 7 };
+
+    /* the table's numbers assume this platform */
+    assert(align == 16 && sizeof(void *) == 8);
+    assert(POOL_SLAB_SIZE == 4096);
+
+    for (size_t i = 0; i < sizeof geom_cases / sizeof geom_cases[0]; i++) {
+        const geom_case_t *c = &geom_cases[i];
+        struct pool_geom g = untouched;
+
+        assert(pool_geometry(c->obj_size, &g) == c->expect_rc);
+        if (c->expect_rc != 0) {
+            assert(memcmp(&g, &untouched, sizeof g) == 0);
+            continue;
+        }
+        assert(g.stride == c->stride);
+        assert(g.slots == c->slots);
+        assert(g.first_off == c->first_off);
+        assert(g.link_off == 0);
+    }
+
+    /* invariant: every obj_size below n has a layout that is aligned, holds
+     * the object and the link, stays inside the slab, and wastes no slot */
+    for (size_t n = 1; n <= 4080; n++) {
+        struct pool_geom g;
+
+        assert(pool_geometry(n, &g) == 0);
+        assert(g.stride >= n);
+        assert(g.stride % align == 0);
+        assert(g.first_off % align == 0);
+        assert(g.first_off >= sizeof(void *)); /* room for the slab header */
+        assert(g.link_off + sizeof(void *) <= g.stride);
+        assert(g.slots >= 1);
+        assert(g.first_off + g.slots * g.stride <= POOL_SLAB_SIZE);
+        assert(g.first_off + (g.slots + 1) * g.stride > POOL_SLAB_SIZE);
+    }
+}
+
 int main(void)
 {
     rb_destroy(NULL); /* must not crash */
@@ -478,6 +544,7 @@ int main(void)
     test_single_node();
     test_overwrite_only_key();
     test_long_keys();
+    test_pool_geometry();
     test_fault_sweep();
 
     printf("all tests passed\n");
