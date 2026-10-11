@@ -3,6 +3,7 @@
 
 #include <assert.h>
 #include <stddef.h>
+#include <string.h>
 
 /* In-band slab header: sits at offset 0 of every 4096-byte slab. */
 struct pool_slab {
@@ -127,6 +128,16 @@ void *pool_alloc(rb_pool_t *p)
     return slot;
 }
 
+/* Who owns a slot's bytes.
+ * Live (from pool_alloc until pool_free): the caller owns bytes
+ * [0, obj_size). The pool neither reads nor writes them.
+ * Dead (from pool_free until pool_alloc hands it out again): the pool owns
+ * all stride bytes. The free-list link takes the first
+ * sizeof(struct pool_slot) bytes, and where link and poison want the same
+ * bytes the link wins: the pool cannot work without it. In debug builds
+ * every byte after the link is POOL_POISON.
+ * Slots of a freshly carved slab are not poisoned, so Valgrind still sees
+ * them as uninitialized until the caller writes them. */
 void pool_free(rb_pool_t *p, void *obj)
 {
     if (!obj) {
@@ -136,6 +147,11 @@ void pool_free(rb_pool_t *p, void *obj)
     /* cheap guard only: a double free while other objects are live, or a
      * pointer from elsewhere, is the caller's contract and is not caught */
     assert(p->live > 0);
+
+#ifndef NDEBUG
+    /* whole slot first; the link below then overwrites the first bytes */
+    memset(obj, POOL_POISON, p->geom.stride);
+#endif
 
     struct pool_slot *slot = obj;
     slot->next = p->free;

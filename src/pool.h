@@ -15,6 +15,8 @@ size_t *slabs, size_t *live, size_t *free_objs);
 void pool_destroy(rb_pool_t *p);
 
 #define POOL_SLAB_SIZE 4096
+/* debug builds fill a dead slot with this, after the free-list link */
+#define POOL_POISON 0xDD
 
 /* Layout of one slab for a given object size. All fields are in bytes
  * except slots, which is a count. */

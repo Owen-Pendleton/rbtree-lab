@@ -811,6 +811,90 @@ static void test_pool_free(void)
     test_pool_free_size(4080);
 }
 
+/* Reads a dead slot through its stale pointer, the way a buggy caller
+ * would: the link must be `link`, every byte after it must be poison. */
+static void check_dead_slot(const void *obj, const void *link, size_t stride)
+{
+    const unsigned char *b = obj;
+    void *found;
+
+    memcpy(&found, obj, sizeof found);
+    assert(found == link);
+
+    /* invariant: bytes sizeof found .. j-1 are poison */
+    for (size_t j = sizeof found; j < stride; j++) {
+        assert(b[j] == POOL_POISON);
+    }
+}
+
+static void test_pool_poison_size(size_t obj_size)
+{
+    struct pool_geom g;
+    void *objs[2 * POOL_TEST_CAP] = { NULL };
+    long  live_before = fault_alloc_live();
+
+    assert(pool_geometry(obj_size, &g) == 0);
+    assert(g.slots <= POOL_TEST_CAP);
+    assert(g.stride > sizeof(void *)); /* there is something to poison */
+    const size_t n = 2 * g.slots;
+
+    rb_pool_t *p = pool_create(obj_size);
+    assert(p != NULL);
+
+    /* two slabs exactly full, so the free list starts empty.
+     * invariant: objects before i are live and hold their pattern */
+    for (size_t i = 0; i < n; i++) {
+        objs[i] = pool_alloc(p);
+        assert(objs[i] != NULL);
+        memset(objs[i], pattern(i), obj_size);
+    }
+    expect_stats(p, 2, n, 0);
+
+    void *a = objs[0];
+    void *b = objs[n - 1];
+    /* the two we free must not look poisoned before they die */
+    assert(pattern(0) != POOL_POISON && pattern(n - 1) != POOL_POISON);
+
+    pool_free(p, a);
+    check_dead_slot(a, NULL, g.stride); /* list was empty: link is NULL */
+    check_pool(p, obj_size);
+
+    if (b != a) { /* one slot per slab at the largest size: a and b differ */
+        pool_free(p, b);
+        check_dead_slot(b, a, g.stride);    /* b links to the old head */
+        check_dead_slot(a, NULL, g.stride); /* and a is undisturbed */
+        check_pool(p, obj_size);
+    }
+
+    /* poisoning stayed inside the dead slots.
+     * invariant: survivors before i hold their full pattern */
+    for (size_t i = 1; i + 1 < n; i++) {
+        const unsigned char *s = objs[i];
+        for (size_t j = 0; j < obj_size; j++) {
+            assert(s[j] == pattern(i));
+        }
+    }
+
+    /* the pool still works: last in, first out */
+    if (b != a) {
+        assert(pool_alloc(p) == b);
+    }
+    assert(pool_alloc(p) == a);
+    expect_stats(p, 2, n, 0);
+    check_pool(p, obj_size);
+
+    pool_destroy(p);
+    assert(fault_alloc_live() == live_before);
+}
+
+static void test_pool_poison(void)
+{
+    test_pool_poison_size(48);
+    test_pool_poison_size(49);
+    test_pool_poison_size(1);
+    test_pool_poison_size(4080);
+}
+
 int main(void)
 {
     rb_destroy(NULL); /* must not crash */
@@ -886,6 +970,7 @@ int main(void)
     test_pool_empty();
     test_pool_alloc();
     test_pool_free();
+    test_pool_poison();
     test_fault_sweep();
 
     printf("all tests passed\n");
