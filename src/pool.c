@@ -82,6 +82,50 @@ rb_pool_t *pool_create(size_t obj_size)
     return p;
 }
 
+/* Gets one more slab and puts all of its slots on the free list.
+ * Returns 0, or -1 if the allocation fails (pool unchanged). */
+static int pool_grow(rb_pool_t *p)
+{
+    const struct pool_geom *g = &p->geom;
+
+    struct pool_slab *s = rb_malloc(POOL_SLAB_SIZE);
+    if (!s) {
+        return -1;
+    }
+
+    s->next  = p->slabs;
+    p->slabs = s;
+    p->n_slabs++;
+
+    char *base = (char *)s; /* char * so the arithmetic below is in bytes */
+
+    /* invariant: slots i..slots-1 of this slab are on the free list, in
+     * ascending address order from the head */
+    for (size_t i = g->slots; i > 0; i--) {
+        struct pool_slot *slot =
+            (struct pool_slot *)(base + g->first_off + (i - 1) * g->stride);
+        slot->next = p->free;
+        p->free    = slot;
+    }
+    p->n_free += g->slots;
+
+    return 0;
+}
+
+void *pool_alloc(rb_pool_t *p)
+{
+    if (!p->free && pool_grow(p) != 0) {
+        return NULL;
+    }
+
+    struct pool_slot *slot = p->free;
+    p->free = slot->next;
+    p->n_free--;
+    p->live++;
+
+    return slot;
+}
+
 void pool_stats(const rb_pool_t *p,
                 size_t *slabs, size_t *live, size_t *free_objs)
 {

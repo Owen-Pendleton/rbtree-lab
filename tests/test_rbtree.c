@@ -525,6 +525,129 @@ static void test_pool_empty(void)
     assert(fault_alloc_live() == live_before);
 }
 
+#define POOL_TEST_CAP 256 /* more than 255, the most slots a slab can have */
+
+static void expect_stats(const rb_pool_t *p,
+                         size_t slabs, size_t live, size_t free_objs)
+{
+    size_t s, l, f;
+
+    pool_stats(p, &s, &l, &f);
+    assert(s == slabs);
+    assert(l == live);
+    assert(f == free_objs);
+}
+
+/* object i is filled with this byte, so overlapping slots show up */
+static unsigned char pattern(size_t i)
+{
+    return (unsigned char)(i + 1);
+}
+
+static void check_patterns(void *const objs[], size_t n, size_t obj_size)
+{
+    /* invariant: objects before i still hold their own pattern in full */
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char *b = objs[i];
+        for (size_t j = 0; j < obj_size; j++) {
+            assert(b[j] == pattern(i));
+        }
+    }
+}
+
+static void test_pool_alloc_size(size_t obj_size)
+{
+    const size_t align = alignof(max_align_t);
+    struct pool_geom g;
+    void *objs[POOL_TEST_CAP + 1];
+    long live_before = fault_alloc_live();
+
+    assert(pool_geometry(obj_size, &g) == 0);
+    assert(g.slots <= POOL_TEST_CAP);
+
+    rb_pool_t *p = pool_create(obj_size);
+    assert(p != NULL);
+
+    /* the very first grow fails: NULL, pool still empty */
+    fault_alloc_arm(1);
+    assert(pool_alloc(p) == NULL);
+    fault_alloc_disarm();
+    expect_stats(p, 0, 0, 0);
+    check_pool(p, obj_size);
+
+    /* fill the first slab exactly.
+     * invariant: i objects are live, all from one slab */
+    for (size_t i = 0; i < g.slots; i++) {
+        long before = fault_alloc_total();
+
+        objs[i] = pool_alloc(p);
+        assert(objs[i] != NULL);
+        /* only the first one may call rb_malloc; the rest are pops */
+        assert(fault_alloc_total() == before + (i == 0 ? 1 : 0));
+        expect_stats(p, 1, i + 1, g.slots - i - 1);
+        check_pool(p, obj_size);
+    }
+
+    uintptr_t lowest = (uintptr_t)objs[0];
+    /* invariant: lowest is the smallest address among objects before i */
+    for (size_t i = 1; i < g.slots; i++) {
+        if ((uintptr_t)objs[i] < lowest) {
+            lowest = (uintptr_t)objs[i];
+        }
+    }
+
+    bool seen[POOL_TEST_CAP] = { false };
+    /* invariant: objects before i are aligned, distinct, and each sits a
+     * whole number of strides (fewer than slots) above the lowest, which
+     * keeps every one of them out of the tail slack */
+    for (size_t i = 0; i < g.slots; i++) {
+        uintptr_t a   = (uintptr_t)objs[i];
+        size_t    off = (size_t)(a - lowest);
+
+        assert(a % align == 0);
+        assert(off % g.stride == 0);
+        assert(off / g.stride < g.slots);
+        assert(!seen[off / g.stride]);
+        seen[off / g.stride] = true;
+    }
+
+    /* invariant: objects before i are filled with their own pattern */
+    for (size_t i = 0; i < g.slots; i++) {
+        memset(objs[i], pattern(i), obj_size);
+    }
+    check_patterns(objs, g.slots, obj_size);
+
+    /* slab full and the next grow fails: NULL, nothing changes */
+    fault_alloc_arm(1);
+    assert(pool_alloc(p) == NULL);
+    fault_alloc_disarm();
+    expect_stats(p, 1, g.slots, 0);
+    check_pool(p, obj_size);
+    check_patterns(objs, g.slots, obj_size);
+
+    /* one more than a slab holds: second slab */
+    objs[g.slots] = pool_alloc(p);
+    assert(objs[g.slots] != NULL);
+    expect_stats(p, 2, g.slots + 1, g.slots - 1);
+    check_pool(p, obj_size);
+    assert((uintptr_t)objs[g.slots] % align == 0);
+    memset(objs[g.slots], pattern(g.slots), obj_size);
+    check_patterns(objs, g.slots + 1, obj_size);
+
+    /* destroy with every object still live: both slabs must go */
+    assert(fault_alloc_live() == live_before + 3);
+    pool_destroy(p);
+    assert(fault_alloc_live() == live_before);
+}
+
+static void test_pool_alloc(void)
+{
+    test_pool_alloc_size(48);   /* struct rb_node: no tail slack */
+    test_pool_alloc_size(49);   /* 63 slots, 48 bytes of tail slack */
+    test_pool_alloc_size(1);    /* 255 slots, link bigger than the object */
+    test_pool_alloc_size(4080); /* one slot per slab: every alloc grows */
+}
+
 int main(void)
 {
     rb_destroy(NULL); /* must not crash */
@@ -598,6 +721,7 @@ int main(void)
     test_long_keys();
     test_pool_geometry();
     test_pool_empty();
+    test_pool_alloc();
     test_fault_sweep();
 
     printf("all tests passed\n");
