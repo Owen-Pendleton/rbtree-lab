@@ -473,6 +473,58 @@ static void test_pool_geometry(void)
     }
 }
 
+/* live + free_objs == slabs * slots, with slots taken from pool_geometry so
+ * the test and the pool cannot disagree on the arithmetic */
+static void check_pool(const rb_pool_t *p, size_t obj_size)
+{
+    struct pool_geom g;
+    size_t slabs, live, free_objs;
+
+    assert(pool_geometry(obj_size, &g) == 0);
+    pool_stats(p, &slabs, &live, &free_objs);
+    assert(live + free_objs == slabs * g.slots);
+}
+
+static void test_pool_empty(void)
+{
+    const size_t obj_size = 48;
+    long total_before = fault_alloc_total();
+    long live_before  = fault_alloc_live();
+
+    pool_destroy(NULL); /* must not crash */
+
+    /* a size with no valid geometry is refused before any allocation */
+    assert(pool_create(0) == NULL);
+    assert(pool_create(4081) == NULL);
+    assert(pool_create(SIZE_MAX) == NULL);
+    assert(fault_alloc_total() == total_before);
+
+    /* the one allocation fails: NULL, nothing left behind */
+    fault_alloc_arm(1);
+    assert(pool_create(obj_size) == NULL);
+    fault_alloc_disarm();
+    assert(fault_alloc_total() == total_before + 1);
+    assert(fault_alloc_live() == live_before);
+
+    rb_pool_t *p = pool_create(obj_size);
+    assert(p != NULL);
+    assert(fault_alloc_live() == live_before + 1); /* the pool, no slab */
+
+    size_t slabs = 9, live = 9, free_objs = 9;
+    pool_stats(p, &slabs, &live, &free_objs);
+    assert(slabs == 0 && live == 0 && free_objs == 0);
+    check_pool(p, obj_size);
+
+    /* each out-pointer is optional */
+    pool_stats(p, NULL, NULL, NULL);
+    slabs = 9;
+    pool_stats(p, &slabs, NULL, NULL);
+    assert(slabs == 0);
+
+    pool_destroy(p);
+    assert(fault_alloc_live() == live_before);
+}
+
 int main(void)
 {
     rb_destroy(NULL); /* must not crash */
@@ -545,6 +597,7 @@ int main(void)
     test_overwrite_only_key();
     test_long_keys();
     test_pool_geometry();
+    test_pool_empty();
     test_fault_sweep();
 
     printf("all tests passed\n");

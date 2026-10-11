@@ -1,4 +1,5 @@
 #include "pool.h"
+#include "../tests/fault_alloc.h"
 
 #include <stddef.h>
 
@@ -10,6 +11,15 @@ struct pool_slab {
 /* What a dead slot holds: the free-list link, at offset 0 of the slot. */
 struct pool_slot {
     struct pool_slot *next;
+};
+
+struct rb_pool {
+    struct pool_slab *slabs;   /* every slab, newest first; destroy walks this */
+    struct pool_slot *free;    /* head of the free list, NULL when empty */
+    size_t            n_slabs;
+    size_t            live;    /* handed out, not yet returned */
+    size_t            n_free;  /* length of the free list */
+    struct pool_geom  geom;    /* computed once, never changes */
 };
 
 /* The slab base comes from rb_malloc, so it is aligned for max_align_t.
@@ -46,4 +56,60 @@ int pool_geometry(size_t obj_size, struct pool_geom *g)
     g->first_off = first_off;
     g->link_off  = offsetof(struct pool_slot, next);
     return 0;
+}
+
+rb_pool_t *pool_create(size_t obj_size)
+{
+    struct pool_geom g;
+
+    /* reject a bad size before allocating anything */
+    if (pool_geometry(obj_size, &g) != 0) {
+        return NULL;
+    }
+
+    struct rb_pool *p = rb_malloc(sizeof *p);
+    if (!p) {
+        return NULL;
+    }
+
+    p->slabs   = NULL;
+    p->free    = NULL;
+    p->n_slabs = 0;
+    p->live    = 0;
+    p->n_free  = 0;
+    p->geom    = g;
+
+    return p;
+}
+
+void pool_stats(const rb_pool_t *p,
+                size_t *slabs, size_t *live, size_t *free_objs)
+{
+    if (slabs) {
+        *slabs = p->n_slabs;
+    }
+    if (live) {
+        *live = p->live;
+    }
+    if (free_objs) {
+        *free_objs = p->n_free;
+    }
+}
+
+void pool_destroy(rb_pool_t *p)
+{
+    if (!p) {
+        return;
+    }
+
+    struct pool_slab *s = p->slabs;
+
+    /* invariant: every slab before s is freed; s and the rest are intact */
+    while (s) {
+        struct pool_slab *next = s->next; /* read before s is freed */
+        rb_free(s);
+        s = next;
+    }
+
+    rb_free(p);
 }
