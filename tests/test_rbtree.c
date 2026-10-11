@@ -895,6 +895,195 @@ static void test_pool_poison(void)
     test_pool_poison_size(4080);
 }
 
+enum { POOL_HELD = 400, POOL_FIRST = 300, POOL_CHURN = 150 };
+
+/* One sweep run: the pool plus the test's own model of what it must hold. */
+typedef struct {
+    rb_pool_t *p;
+    size_t     obj_size;
+    size_t     slots;            /* per slab, from pool_geometry */
+    size_t     slabs;            /* model: grows that succeeded */
+    size_t     live;             /* model: non-NULL entries of held */
+    void      *held[POOL_HELD];  /* NULL = not currently allocated */
+} pool_run_t;
+
+/* the pool's three numbers must equal the model's, not merely add up */
+static void pool_run_check(const pool_run_t *r)
+{
+    expect_stats(r->p, r->slabs, r->live, r->slabs * r->slots - r->live);
+    check_pool(r->p, r->obj_size);
+}
+
+static void pool_run_check_obj(const pool_run_t *r, size_t i)
+{
+    const unsigned char *b = r->held[i];
+
+    /* invariant: bytes before j still hold object i's pattern */
+    for (size_t j = 0; j < r->obj_size; j++) {
+        assert(b[j] == pattern(i));
+    }
+}
+
+/* a slot handed to two holders would show up here as a wrecked pattern */
+static void pool_run_check_live(const pool_run_t *r)
+{
+    size_t n = 0;
+
+    /* invariant: n held objects before i are intact */
+    for (size_t i = 0; i < POOL_HELD; i++) {
+        if (r->held[i]) {
+            pool_run_check_obj(r, i);
+            n++;
+        }
+    }
+    assert(n == r->live);
+}
+
+/* Allocate into held[i]. Returns whether this call hit the fault. */
+static bool pool_run_alloc(pool_run_t *r, size_t i)
+{
+    size_t free_objs;
+
+    assert(r->held[i] == NULL);
+    pool_stats(r->p, NULL, NULL, &free_objs);
+
+    long  before = fault_alloc_total();
+    void *o      = pool_alloc(r->p);
+    bool  hit    = fault_hit(before);
+
+    if (free_objs > 0) {
+        /* a pop: no rb_malloc, so it cannot fail */
+        assert(fault_alloc_total() == before);
+        assert(o != NULL);
+    } else {
+        /* a grow: exactly one rb_malloc, and it is the only way to fail */
+        assert(fault_alloc_total() == before + 1);
+        if (hit) {
+            assert(o == NULL);
+        } else {
+            assert(o != NULL);
+            r->slabs++;
+        }
+    }
+
+    if (o) {
+        memset(o, pattern(i), r->obj_size);
+        r->held[i] = o;
+        r->live++;
+    }
+    pool_run_check(r); /* on a failed grow: model untouched, so must the pool be */
+    return hit;
+}
+
+/* Free held[i], which may be absent if its alloc was the one that failed. */
+static void pool_run_free(pool_run_t *r, size_t i)
+{
+    if (!r->held[i]) {
+        return;
+    }
+    pool_run_check_obj(r, i);
+
+    long before = fault_alloc_total();
+    pool_free(r->p, r->held[i]);
+    assert(fault_alloc_total() == before);
+
+    r->held[i] = NULL;
+    r->live--;
+    pool_run_check(r);
+}
+
+/* One run: allocate POOL_FIRST, free POOL_CHURN of them scrambled, allocate
+ * those back, free everything scrambled, allocate POOL_HELD, destroy with
+ * all of them live; the n-th allocation fails. 37 shares no factor with
+ * POOL_FIRST or POOL_HELD, so each scramble visits every index once.
+ * Returns whether the fault was hit. */
+static bool pool_scenario(size_t obj_size, long n)
+{
+    bool hit = false;
+    long live_before = fault_alloc_live();
+    struct pool_geom g;
+    pool_run_t r = { .obj_size = obj_size };
+
+    assert(pool_geometry(obj_size, &g) == 0);
+    r.slots = g.slots;
+
+    fire_at = fault_alloc_total() + n;
+    fault_alloc_arm(n);
+
+    long before = fault_alloc_total();
+    r.p = pool_create(obj_size);
+    if (fault_hit(before)) {
+        assert(r.p == NULL);
+        fault_alloc_disarm();
+        assert(fault_alloc_live() == live_before);
+        return true;
+    }
+    assert(r.p != NULL);
+    pool_run_check(&r);
+
+    /* invariant: held[0..i-1] are allocated, except one if it faulted */
+    for (size_t i = 0; i < POOL_FIRST; i++) {
+        hit |= pool_run_alloc(&r, i);
+    }
+    pool_run_check_live(&r);
+
+    /* invariant: the first i scrambled indices are not held */
+    for (size_t i = 0; i < POOL_CHURN; i++) {
+        pool_run_free(&r, (i * 37) % POOL_FIRST);
+    }
+    pool_run_check_live(&r);
+
+    /* invariant: the first i scrambled indices are held again */
+    for (size_t i = 0; i < POOL_CHURN; i++) {
+        hit |= pool_run_alloc(&r, (i * 37) % POOL_FIRST);
+    }
+    pool_run_check_live(&r);
+
+    /* invariant: the first i scrambled indices are not held */
+    for (size_t i = 0; i < POOL_HELD; i++) {
+        pool_run_free(&r, (i * 37) % POOL_HELD);
+    }
+    assert(r.live == 0);
+
+    /* invariant: held[0..i-1] are allocated, except one if it faulted */
+    for (size_t i = 0; i < POOL_HELD; i++) {
+        hit |= pool_run_alloc(&r, i);
+    }
+    pool_run_check_live(&r);
+
+    fault_alloc_disarm();
+    pool_destroy(r.p); /* every object still live */
+    assert(fault_alloc_live() == live_before);
+    return hit;
+}
+
+/* expect_faulted: one fault point for the pool plus one per slab a clean
+ * run needs, so a change in how often the pool allocates fails here */
+static void test_pool_sweep_size(size_t obj_size, long expect_faulted)
+{
+    long n = 1;
+
+    /* invariant: every run with a fault index below n hit its fault */
+    while (pool_scenario(obj_size, n)) {
+        printf("pool sweep size=%zu n=%ld: faulted, ok\n", obj_size, n);
+        fflush(stdout); /* keep the line if a later assert aborts */
+        n++;
+        assert(n < MAX_SWEEP);
+    }
+
+    printf("pool fault sweep passed: size=%zu, %ld faulted runs, clean at n=%ld\n",
+           obj_size, n - 1, n);
+    assert(n - 1 == expect_faulted);
+}
+
+static void test_pool_sweep(void)
+{
+    test_pool_sweep_size(48, 6);     /* pool + 5 slabs of 85 for 400 */
+    test_pool_sweep_size(49, 8);     /* pool + 7 slabs of 63 */
+    test_pool_sweep_size(1, 3);      /* pool + 2 slabs of 255 */
+    test_pool_sweep_size(4080, 401); /* pool + one slab per object */
+}
+
 int main(void)
 {
     rb_destroy(NULL); /* must not crash */
@@ -971,6 +1160,7 @@ int main(void)
     test_pool_alloc();
     test_pool_free();
     test_pool_poison();
+    test_pool_sweep();
     test_fault_sweep();
 
     printf("all tests passed\n");
