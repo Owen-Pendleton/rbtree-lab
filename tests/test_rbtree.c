@@ -648,6 +648,169 @@ static void test_pool_alloc(void)
     test_pool_alloc_size(4080); /* one slot per slab: every alloc grows */
 }
 
+/* last in, first out, on a pool of its own */
+static void test_pool_free_lifo(size_t obj_size)
+{
+    long live_before = fault_alloc_live();
+    size_t slabs;
+
+    rb_pool_t *p = pool_create(obj_size);
+    assert(p != NULL);
+
+    void *a = pool_alloc(p);
+    void *b = pool_alloc(p);
+    void *c = pool_alloc(p);
+    assert(a && b && c);
+    pool_stats(p, &slabs, NULL, NULL);
+    check_pool(p, obj_size);
+
+    long total = fault_alloc_total();
+
+    pool_free(p, b);
+    check_pool(p, obj_size);
+    assert(pool_alloc(p) == b);
+    check_pool(p, obj_size);
+
+    pool_free(p, a);
+    pool_free(p, c);
+    check_pool(p, obj_size);
+    assert(pool_alloc(p) == c);
+    assert(pool_alloc(p) == a);
+    check_pool(p, obj_size);
+
+    /* NULL is a no-op */
+    size_t live, free_objs;
+    pool_stats(p, NULL, &live, &free_objs);
+    pool_free(p, NULL);
+    expect_stats(p, slabs, live, free_objs);
+    assert(live == 3);
+
+    /* none of that touched rb_malloc, and no slab came or went */
+    assert(fault_alloc_total() == total);
+    expect_stats(p, slabs, 3, free_objs);
+
+    pool_destroy(p);
+    assert(fault_alloc_live() == live_before);
+}
+
+static void test_pool_free_size(size_t obj_size)
+{
+    struct pool_geom g;
+    void *objs[2 * POOL_TEST_CAP];
+    bool  dead[2 * POOL_TEST_CAP] = { false };
+    long  live_before = fault_alloc_live();
+
+    assert(pool_geometry(obj_size, &g) == 0);
+    assert(g.slots <= POOL_TEST_CAP);
+    const size_t n = 2 * g.slots; /* exactly two slabs' worth */
+
+    test_pool_free_lifo(obj_size);
+
+    rb_pool_t *p = pool_create(obj_size);
+    assert(p != NULL);
+
+    /* invariant: i objects are live */
+    for (size_t i = 0; i < n; i++) {
+        objs[i] = pool_alloc(p);
+        assert(objs[i] != NULL);
+        check_pool(p, obj_size);
+    }
+    expect_stats(p, 2, n, 0);
+
+    long total = fault_alloc_total();
+
+    /* free everything: slabs stay, every slot ends up free.
+     * invariant: i objects have been returned */
+    for (size_t i = 0; i < n; i++) {
+        pool_free(p, objs[i]);
+        expect_stats(p, 2, n - i - 1, i + 1);
+        check_pool(p, obj_size);
+    }
+
+    /* take them all again: same addresses, no new slab, no rb_malloc.
+     * invariant: the i objects taken so far are distinct members of objs */
+    bool taken[2 * POOL_TEST_CAP] = { false };
+    for (size_t i = 0; i < n; i++) {
+        void  *o = pool_alloc(p);
+        size_t j = 0;
+
+        /* invariant: o is none of objs[0..j-1] */
+        while (j < n && objs[j] != o) {
+            j++;
+        }
+        assert(j < n);
+        assert(!taken[j]);
+        taken[j] = true;
+        expect_stats(p, 2, i + 1, n - i - 1);
+        check_pool(p, obj_size);
+    }
+    assert(fault_alloc_total() == total);
+
+    /* invariant: objects before i hold their own pattern */
+    for (size_t i = 0; i < n; i++) {
+        memset(objs[i], pattern(i), obj_size);
+    }
+
+    /* free every other object, alternating between the two halves of
+     * objs so the free list hops from one slab to the other.
+     * invariant: n_dead objects are dead, the rest hold their pattern */
+    size_t n_dead = 0;
+    for (size_t k = 0; k < g.slots; k += 2) {
+        pool_free(p, objs[k]);
+        dead[k] = true;
+        pool_free(p, objs[k + g.slots]);
+        dead[k + g.slots] = true;
+        n_dead += 2;
+        expect_stats(p, 2, n - n_dead, n_dead);
+        check_pool(p, obj_size);
+    }
+    assert(fault_alloc_total() == total);
+
+    /* the link was written inside the dead slots only.
+     * invariant: survivors before i are intact */
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char *b = objs[i];
+        for (size_t j = 0; !dead[i] && j < obj_size; j++) {
+            assert(b[j] == pattern(i));
+        }
+    }
+
+    /* invariant: each object taken so far was a dead one, taken once */
+    for (size_t i = 0; i < n_dead; i++) {
+        void  *o = pool_alloc(p);
+        size_t j = 0;
+
+        /* invariant: o is none of objs[0..j-1] */
+        while (j < n && objs[j] != o) {
+            j++;
+        }
+        assert(j < n);
+        assert(dead[j]);
+        dead[j] = false;
+        memset(o, pattern(j), obj_size);
+        check_pool(p, obj_size);
+    }
+    expect_stats(p, 2, n, 0);
+    assert(fault_alloc_total() == total);
+    check_patterns(objs, n, obj_size);
+
+    /* destroy with a mix of live and dead objects */
+    pool_free(p, objs[0]);
+    pool_free(p, objs[n - 1]);
+    expect_stats(p, 2, n - 2, 2);
+    check_pool(p, obj_size);
+    pool_destroy(p);
+    assert(fault_alloc_live() == live_before);
+}
+
+static void test_pool_free(void)
+{
+    test_pool_free_size(48);
+    test_pool_free_size(49);
+    test_pool_free_size(1);
+    test_pool_free_size(4080);
+}
+
 int main(void)
 {
     rb_destroy(NULL); /* must not crash */
@@ -722,6 +885,7 @@ int main(void)
     test_pool_geometry();
     test_pool_empty();
     test_pool_alloc();
+    test_pool_free();
     test_fault_sweep();
 
     printf("all tests passed\n");

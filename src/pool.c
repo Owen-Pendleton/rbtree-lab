@@ -1,6 +1,7 @@
 #include "pool.h"
 #include "../tests/fault_alloc.h"
 
+#include <assert.h>
 #include <stddef.h>
 
 /* In-band slab header: sits at offset 0 of every 4096-byte slab. */
@@ -124,6 +125,23 @@ void *pool_alloc(rb_pool_t *p)
     p->live++;
 
     return slot;
+}
+
+void pool_free(rb_pool_t *p, void *obj)
+{
+    if (!obj) {
+        return;
+    }
+
+    /* cheap guard only: a double free while other objects are live, or a
+     * pointer from elsewhere, is the caller's contract and is not caught */
+    assert(p->live > 0);
+
+    struct pool_slot *slot = obj;
+    slot->next = p->free;
+    p->free    = slot;
+    p->n_free++;
+    p->live--;
 }
 
 void pool_stats(const rb_pool_t *p,
