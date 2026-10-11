@@ -1,4 +1,5 @@
 #include "rbtree.h"
+#include "pool.h"
 #include "../tests/fault_alloc.h"
 
 #include <stddef.h>
@@ -21,6 +22,7 @@ struct rbtree {
     struct rb_node    nil;  /* sentinel, embedded by value, always black */
     size_t            size;
     rb_value_free_fn  value_free;
+    rb_pool_t        *pool; /* node storage; NULL = nodes come from rb_malloc */
 };
 
 rbtree_t *rb_create(rb_value_free_fn value_free)
@@ -40,8 +42,31 @@ rbtree_t *rb_create(rb_value_free_fn value_free)
     t->root       = &t->nil;
     t->size       = 0;
     t->value_free = value_free;
+    t->pool       = NULL;
 
     return t;
+}
+
+rbtree_t *rb_create_pooled(rb_value_free_fn value_free)
+{
+    rbtree_t  *t    = NULL;
+    rb_pool_t *pool = NULL;
+
+    t = rb_create(value_free);
+    if (!t) {
+        goto cleanup;
+    }
+    pool = pool_create(sizeof(struct rb_node));
+    if (!pool) {
+        goto cleanup;
+    }
+
+    t->pool = pool;
+    return t;
+
+cleanup:
+    rb_free(t);
+    return NULL;
 }
 
 static char *dup_key(const char *key)
@@ -53,6 +78,23 @@ static char *dup_key(const char *key)
     }
     memcpy(copy, key, len);
     return copy;
+}
+
+/* Node storage: from the tree's pool if it has one, else from rb_malloc.
+ * Either way the memory is uninitialized; the caller sets every field. */
+static struct rb_node *node_alloc(rbtree_t *t)
+{
+    return t->pool ? pool_alloc(t->pool) : rb_malloc(sizeof(struct rb_node));
+}
+
+/* NULL-safe, like rb_free. */
+static void node_free(rbtree_t *t, struct rb_node *node)
+{
+    if (t->pool) {
+        pool_free(t->pool, node);
+    } else {
+        rb_free(node);
+    }
 }
 
 static void rotate_left(rbtree_t *t, struct rb_node *x)
@@ -167,7 +209,7 @@ int rb_insert(rbtree_t *t, const char *key, void *value)
     char *key_copy = NULL;
     int rc = -1;
 
-    node = rb_malloc(sizeof *node);
+    node = node_alloc(t);
     if (!node) {
         goto cleanup;
     }
@@ -198,7 +240,7 @@ int rb_insert(rbtree_t *t, const char *key, void *value)
 cleanup:
     if (rc != 0) {
         rb_free(key_copy);
-        rb_free(node);
+        node_free(t, node);
     }
     return rc;
 }
@@ -333,7 +375,7 @@ int rb_delete(rbtree_t *t, const char *key)
         t->value_free(z->value);
     }
     rb_free(z->key);
-    rb_free(z);
+    node_free(t, z);
     t->size--;
     return 0;
 }
@@ -406,7 +448,9 @@ static void destroy_subtree(rbtree_t *t, struct rb_node *node)
         t->value_free(node->value);
     }
     rb_free(node->key);
-    rb_free(node);
+    if (!t->pool) {
+        rb_free(node); /* pooled nodes go back wholesale in rb_destroy */
+    }
 }
 
 void rb_destroy(rbtree_t *t)
@@ -415,6 +459,7 @@ void rb_destroy(rbtree_t *t)
         return;
     }
     destroy_subtree(t, t->root);
+    pool_destroy(t->pool);
     rb_free(t);
 }
 

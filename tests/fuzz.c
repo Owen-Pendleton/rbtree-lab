@@ -5,6 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* RB_POOLED set in the environment: fuzz the pooled tree instead. */
+static rbtree_t *make_tree(void)
+{
+    return getenv("RB_POOLED") ? rb_create_pooled(free) : rb_create(free);
+}
+
 /* Reference model: keys are always "k<num>" with num in [0, 2n), so the
  * cheapest trustworthy oracle is a pair of arrays indexed directly by num,
  * updated in lockstep with every rb_insert. */
@@ -57,7 +63,7 @@ static bool replay_is_broken(const struct op *ops, long len, long n)
 {
     bool *present = calloc((size_t)(n * 2), sizeof *present);
     int  *value   = malloc((size_t)(n * 2) * sizeof *value);
-    rbtree_t *t   = (present && value) ? rb_create(free) : NULL;
+    rbtree_t *t   = (present && value) ? make_tree() : NULL;
     if (!present || !value || !t) {
         free(present);
         free(value);
@@ -196,7 +202,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    rbtree_t *t = rb_create(free);
+    rbtree_t *t = make_tree();
     if (!t) {
         fprintf(stderr, "rb_create failed\n");
         free(model.present);
@@ -355,6 +361,7 @@ int main(int argc, char **argv)
     free(model.present);
     free(model.value);
     free(ops);
-    printf("fuzz ok: %ld operations (seed=%ld)\n", n, seed);
+    printf("fuzz ok: %ld operations (seed=%ld)%s\n", n, seed,
+           getenv("RB_POOLED") ? ", pooled" : "");
     return 0;
 }

@@ -10,6 +10,9 @@
 
 static int free_count = 0;
 
+/* Which constructor the tree battery uses; main runs it once per kind. */
+static rbtree_t *(*create_tree)(rb_value_free_fn) = rb_create;
+
 static void counting_free(void *value)
 {
     free_count++;
@@ -84,7 +87,7 @@ static void test_delete_cases(void)
 {
     for (size_t i = 0; i < sizeof delete_cases / sizeof delete_cases[0]; i++) {
         const delete_case_t *c = &delete_cases[i];
-        rbtree_t *t = rb_create(free);
+        rbtree_t *t = create_tree(free);
         assert(t != NULL);
         for (size_t j = 0; j < c->n_inserts; j++) {
             assert(rb_insert(t, c->inserts[j], make_int((int)j)) == 0);
@@ -106,7 +109,7 @@ static void count_calls(const char *key, void *value, void *ctx)
 
 static void test_empty_tree(void)
 {
-    rbtree_t *t = rb_create(counting_free);
+    rbtree_t *t = create_tree(counting_free);
     assert(t != NULL);
 
     assert(rb_size(t) == 0);
@@ -123,7 +126,7 @@ static void test_empty_tree(void)
 
 static void test_single_node(void)
 {
-    rbtree_t *t = rb_create(counting_free);
+    rbtree_t *t = create_tree(counting_free);
     assert(t != NULL);
 
     assert(rb_insert(t, "solo", make_int(42)) == 0);
@@ -144,7 +147,7 @@ static void test_single_node(void)
 
 static void test_overwrite_only_key(void)
 {
-    rbtree_t *t = rb_create(counting_free);
+    rbtree_t *t = create_tree(counting_free);
     assert(t != NULL);
 
     assert(rb_insert(t, "solo", make_int(1)) == 0);
@@ -196,7 +199,7 @@ static void test_long_keys(void)
     memset(near_dup, 'a', LONG_KEY_LEN);
     near_dup[LONG_KEY_LEN] = '\0';
 
-    rbtree_t *t = rb_create(counting_free);
+    rbtree_t *t = create_tree(counting_free);
     assert(t != NULL);
 
     assert(rb_insert(t, long_key, make_int(7)) == 0);
@@ -357,7 +360,7 @@ static bool run_scenario(long n)
     fault_alloc_arm(n);
 
     long before = fault_alloc_total();
-    rbtree_t *t = rb_create(counting_free);
+    rbtree_t *t = create_tree(counting_free);
     if (fault_hit(before)) {
         assert(t == NULL);
         fault_alloc_disarm();
@@ -394,7 +397,9 @@ static bool run_scenario(long n)
     return hit;
 }
 
-static void test_fault_sweep(void)
+/* expect_faulted: one fault point per rb_malloc a clean run makes, so a
+ * change in how often the tree allocates fails here */
+static void test_fault_sweep(long expect_faulted)
 {
     long n = 1;
 
@@ -407,6 +412,8 @@ static void test_fault_sweep(void)
     }
 
     printf("fault sweep passed: %ld faulted runs, clean at n=%ld\n", n - 1, n);
+    fflush(stdout); /* show the count even if the next assert aborts */
+    assert(n - 1 == expect_faulted);
 }
 
 typedef struct {
@@ -1073,6 +1080,7 @@ static void test_pool_sweep_size(size_t obj_size, long expect_faulted)
 
     printf("pool fault sweep passed: size=%zu, %ld faulted runs, clean at n=%ld\n",
            obj_size, n - 1, n);
+    fflush(stdout); /* show the count even if the next assert aborts */
     assert(n - 1 == expect_faulted);
 }
 
@@ -1084,11 +1092,15 @@ static void test_pool_sweep(void)
     test_pool_sweep_size(4080, 401); /* pool + one slab per object */
 }
 
-int main(void)
+/* The whole Assignment 1 + Mutation 1 battery, on whichever kind of tree
+ * create_tree makes. */
+static void test_tree_battery(long expect_faulted)
 {
+    free_count = 0; /* the checks below count from zero */
+
     rb_destroy(NULL); /* must not crash */
 
-    rbtree_t *t = rb_create(counting_free);
+    rbtree_t *t = create_tree(counting_free);
     assert(t != NULL);
 
     assert(rb_insert(t, "banana", make_int(2)) == 0);
@@ -1114,7 +1126,7 @@ int main(void)
     assert(free_count == 4); /* 1 overwrite + 3 remaining nodes */
 
     /* value_free == NULL: tree does not own these values */
-    rbtree_t *t2 = rb_create(NULL);
+    rbtree_t *t2 = create_tree(NULL);
     assert(t2 != NULL);
 
     static int nums[2] = {10, 20};
@@ -1133,7 +1145,7 @@ int main(void)
      * a root-level rotation could leave rb_validate passing on the
      * (still internally well-formed) orphaned subtree while silently
      * dropping nodes from the reachable tree. */
-    rbtree_t *t3 = rb_create(free);
+    rbtree_t *t3 = create_tree(free);
     assert(t3 != NULL);
 
     char key[3];
@@ -1155,13 +1167,129 @@ int main(void)
     test_single_node();
     test_overwrite_only_key();
     test_long_keys();
+    test_fault_sweep(expect_faulted);
+}
+
+/* The battery alone cannot tell a pooled tree from a plain one, so pin the
+ * difference: a pooled insert takes its node from a slab, and only calls
+ * rb_malloc for the key copy unless a new slab is needed. */
+static void test_pooled_uses_pool(void)
+{
+    struct pool_geom g;
+    static int v;
+    char key[KEY_CAP];
+    long live_before = fault_alloc_live();
+
+    /* 48 = sizeof(struct rb_node), which the test cannot name directly */
+    assert(pool_geometry(48, &g) == 0);
+
+    rbtree_t *t = rb_create_pooled(NULL);
+    assert(t != NULL);
+    assert(fault_alloc_live() == live_before + 2); /* tree + pool, no slab */
+
+    /* two slabs' worth of new keys.
+     * invariant: the i keys so far cost one rb_malloc each, plus one per slab */
+    for (size_t i = 0; i < 2 * g.slots; i++) {
+        long before = fault_alloc_total();
+
+        make_key(key, (int)i);
+        assert(rb_insert(t, key, &v) == 0);
+        assert(fault_alloc_total() == before + (i % g.slots == 0 ? 2 : 1));
+    }
+    assert(rb_validate(t) == 0);
+
+    /* a deleted node's slot is reused: still one rb_malloc, for the key */
+    make_key(key, 0);
+    assert(rb_delete(t, key) == 0);
+    long before = fault_alloc_total();
+    assert(rb_insert(t, key, &v) == 0);
+    assert(fault_alloc_total() == before + 1);
+    assert(rb_validate(t) == 0);
+
+    rb_destroy(t);
+    assert(fault_alloc_live() == live_before);
+}
+
+/* A pooled insert whose key copy fails must hand its node back to the
+ * pool. A lost slot leaks no memory (rb_destroy frees the slab), so only
+ * counting rb_malloc calls on the inserts that follow can see it. */
+static void test_pooled_failed_insert(void)
+{
+    struct pool_geom g;
+    static int v;
+    char key[KEY_CAP];
+    long live_before = fault_alloc_live();
+
+    assert(pool_geometry(48, &g) == 0);
+
+    rbtree_t *t = rb_create_pooled(NULL);
+    assert(t != NULL);
+
+    /* invariant: i keys are in the tree, all in the first slab */
+    for (size_t i = 0; i < g.slots; i++) {
+        make_key(key, (int)i);
+        assert(rb_insert(t, key, &v) == 0);
+    }
+
+    /* one free slot; the node comes from it, then the key copy fails */
+    make_key(key, 0);
+    assert(rb_delete(t, key) == 0);
+    fault_alloc_arm(1);
+    assert(rb_insert(t, key, &v) == -1);
+    fault_alloc_disarm();
+    assert(rb_size(t) == g.slots - 1);
+    assert(rb_find(t, key) == NULL);
+    assert(rb_validate(t) == 0);
+
+    /* the slot is still there: the retry needs no new slab */
+    long before = fault_alloc_total();
+    assert(rb_insert(t, key, &v) == 0);
+    assert(fault_alloc_total() == before + 1);
+
+    /* slab full: the new slab arrives, then the key copy fails */
+    make_key(key, (int)g.slots);
+    before = fault_alloc_total();
+    fault_alloc_arm(2);
+    assert(rb_insert(t, key, &v) == -1);
+    fault_alloc_disarm();
+    assert(fault_alloc_total() == before + 2);
+    assert(rb_size(t) == g.slots);
+    assert(rb_find(t, key) == NULL);
+    assert(rb_validate(t) == 0);
+
+    /* that slab was kept with every slot free: a slab's worth of new keys
+     * costs one rb_malloc each.
+     * invariant: i of the second slab's slots are in use */
+    for (size_t i = 0; i < g.slots; i++) {
+        make_key(key, (int)(g.slots + i));
+        before = fault_alloc_total();
+        assert(rb_insert(t, key, &v) == 0);
+        assert(fault_alloc_total() == before + 1);
+    }
+    assert(rb_validate(t) == 0);
+
+    rb_destroy(t);
+    assert(fault_alloc_live() == live_before);
+}
+
+int main(void)
+{
+    printf("== tree battery: rb_create\n");
+    create_tree = rb_create;
+    test_tree_battery(601); /* tree + 2 x 300 new-key inserts */
+
     test_pool_geometry();
     test_pool_empty();
     test_pool_alloc();
     test_pool_free();
     test_pool_poison();
     test_pool_sweep();
-    test_fault_sweep();
+    test_pooled_uses_pool();
+    test_pooled_failed_insert();
+
+    printf("== tree battery: rb_create_pooled\n");
+    create_tree = rb_create_pooled;
+    test_tree_battery(305); /* tree + pool + 300 key copies + 3 slabs */
 
     printf("all tests passed\n");
     return 0;
