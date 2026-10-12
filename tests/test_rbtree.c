@@ -273,6 +273,68 @@ static void check_tree(const rbtree_t *t)
     assert(w.matched == n);
 }
 
+enum { N_REENTRANT = 64 }; /* keys are the even indices 0, 2, ..., 126 */
+
+struct reentrant_walk {
+    const rbtree_t *t;
+    int             seen; /* callbacks so far */
+};
+
+/* Uses the tree from inside the walk: rb_foreach must leave it intact
+ * while fn runs. */
+static void check_reentrant(const char *key, void *value, void *ctx)
+{
+    struct reentrant_walk *w = ctx;
+    int idx = 2 * w->seen;
+
+    char want[KEY_CAP];
+    make_key(want, idx);
+    assert(strcmp(key, want) == 0);
+    assert(*(int *)value == idx);
+
+    assert(rb_validate(w->t) == 0);
+    assert(rb_find(w->t, key) == value);
+
+    /* the odd neighbours are absent; a search for one runs down to a leaf
+     * right beside the node being visited */
+    char absent[KEY_CAP];
+    make_key(absent, idx + 1);
+    assert(rb_find(w->t, absent) == NULL);
+    if (idx > 0) {
+        make_key(absent, idx - 1);
+        assert(rb_find(w->t, absent) == NULL);
+    }
+
+    w->seen++;
+}
+
+static void test_foreach_reentrant(void)
+{
+    static int vals[N_REENTRANT];
+    long live_before = fault_alloc_live();
+
+    rbtree_t *t = create_tree(NULL);
+    assert(t != NULL);
+
+    /* scrambled insertion order; 37 is coprime to 64, so j takes every
+     * value in [0, 64) exactly once */
+    for (int i = 0; i < N_REENTRANT; i++) {
+        int j = (i * 37) % N_REENTRANT;
+        char key[KEY_CAP];
+        make_key(key, 2 * j);
+        vals[j] = 2 * j;
+        assert(rb_insert(t, key, &vals[j]) == 0);
+    }
+
+    struct reentrant_walk w = { t, 0 };
+    rb_foreach(t, check_reentrant, &w);
+    assert(w.seen == N_REENTRANT);
+    assert(rb_validate(t) == 0);
+
+    rb_destroy(t);
+    assert(fault_alloc_live() == live_before);
+}
+
 /* fault_alloc_total() value at which the armed fault fires */
 static long fire_at;
 
@@ -1163,6 +1225,7 @@ static void test_tree_battery(long expect_faulted)
     rb_destroy(t3);
 
     test_delete_cases();
+    test_foreach_reentrant();
     test_empty_tree();
     test_single_node();
     test_overwrite_only_key();

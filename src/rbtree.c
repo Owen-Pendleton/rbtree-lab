@@ -476,23 +476,45 @@ size_t rb_size(const rbtree_t *t)
     return t->size;
 }
 
-static void foreach_subtree(const rbtree_t *t, const struct rb_node *node,
-                             void (*fn)(const char *, void *, void *),
-                             void *ctx)
-{
-    if (node == &t->nil) {
-        return;
-    }
-    foreach_subtree(t, node->left, fn, ctx);
-    fn(node->key, node->value, ctx);
-    foreach_subtree(t, node->right, fn, ctx);
-}
-
 void rb_foreach(const rbtree_t *t,
                 void (*fn)(const char *key, void *value, void *ctx),
                 void *ctx)
 {
-    foreach_subtree(t, t->root, fn, ctx);
+    const struct rb_node *nil = &t->nil;
+    const struct rb_node *cur = t->root;
+
+    if (cur == nil) {
+        return;
+    }
+
+    /* invariant: the smallest key lies in the subtree rooted at cur */
+    while (cur->left != nil) {
+        cur = cur->left;
+    }
+
+    /* invariant: every key smaller than cur's has been passed to fn exactly
+     * once, in order; cur == nil means every key has been visited */
+    while (cur != nil) {
+        fn(cur->key, cur->value, ctx);
+
+        if (cur->right != nil) {
+            /* successor is the leftmost node of the right subtree */
+            cur = cur->right;
+            while (cur->left != nil) {
+                cur = cur->left;
+            }
+        } else {
+            const struct rb_node *p = cur->parent;
+
+            /* invariant: every key in the subtree rooted at cur has been
+             * visited; stop at the first ancestor reached from its left */
+            while (p != nil && cur == p->right) {
+                cur = p;
+                p = p->parent;
+            }
+            cur = p;
+        }
+    }
 }
 
 void *rb_find(const rbtree_t *t, const char *key)
