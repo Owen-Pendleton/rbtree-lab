@@ -437,28 +437,36 @@ int rb_validate(const rbtree_t *t)
     return black_height(t, t->root) == -1 ? -1 : 0;
 }
 
-static void destroy_subtree(rbtree_t *t, struct rb_node *node)
-{
-    if (node == &t->nil) {
-        return;
-    }
-    destroy_subtree(t, node->left);
-    destroy_subtree(t, node->right);
-    if (t->value_free) {
-        t->value_free(node->value);
-    }
-    rb_free(node->key);
-    if (!t->pool) {
-        rb_free(node); /* pooled nodes go back wholesale in rb_destroy */
-    }
-}
-
 void rb_destroy(rbtree_t *t)
 {
     if (!t) {
         return;
     }
-    destroy_subtree(t, t->root);
+
+    struct rb_node *cur = t->root;
+
+    /* invariant: every node not yet freed is in the subtree rooted at cur,
+     * and every key smaller than that subtree's has already been freed */
+    while (cur != &t->nil) {
+        if (cur->left != &t->nil) {
+            /* rotate right: the left child comes up. parent and color are
+             * not maintained, the tree is being torn down */
+            struct rb_node *l = cur->left;
+            cur->left = l->right;
+            l->right  = cur;
+            cur = l;
+        } else {
+            struct rb_node *next = cur->right; /* read before freeing cur */
+            if (t->value_free) {
+                t->value_free(cur->value);
+            }
+            rb_free(cur->key);
+            if (!t->pool) {
+                rb_free(cur); /* pooled nodes go back wholesale below */
+            }
+            cur = next;
+        }
+    }
     pool_destroy(t->pool);
     rb_free(t);
 }
