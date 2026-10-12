@@ -476,6 +476,21 @@ size_t rb_size(const rbtree_t *t)
     return t->size;
 }
 
+/* Contract for fn reaching back into the tree it is being called from:
+ *
+ * Allowed: rb_find, rb_size, rb_validate, and a nested rb_foreach on t.
+ * The walk never writes to the tree, so t is a valid red-black tree every
+ * time fn runs. fn may also change the object its value points to.
+ *
+ * Not allowed: rb_insert, rb_delete, rb_destroy or rb_snapshot on t.
+ * The behaviour is undefined and is not detected. The walk holds a pointer
+ * to the current node across the call to fn; rb_delete can free that node
+ * (even when asked for a different key, because the two-children case
+ * frees the successor's node), and can move a not-yet-visited key into a
+ * node already passed.
+ *
+ * To delete while walking: collect the keys in fn, delete after rb_foreach
+ * returns. */
 void rb_foreach(const rbtree_t *t,
                 void (*fn)(const char *key, void *value, void *ctx),
                 void *ctx)

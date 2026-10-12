@@ -335,6 +335,128 @@ static void test_foreach_reentrant(void)
     assert(fault_alloc_live() == live_before);
 }
 
+enum { N_RESTORE = 128 };
+
+/* One walk's worth of visits, in the order rb_foreach made them. */
+struct key_list {
+    const char *key[N_RESTORE];           /* the pointer fn was handed */
+    char        text[N_RESTORE][KEY_CAP]; /* a copy of the characters */
+    void       *value[N_RESTORE];
+    size_t      n;                        /* entries filled so far */
+};
+
+static void collect_keys(const char *key, void *value, void *ctx)
+{
+    struct key_list *l = ctx;
+
+    assert(l->n < N_RESTORE);
+    l->key[l->n] = key;
+    assert(snprintf(l->text[l->n], KEY_CAP, "%s", key) < KEY_CAP);
+    l->value[l->n] = value;
+    l->n++;
+}
+
+struct hostile_walk {
+    const rbtree_t *t;
+    void           *frame; /* this callback's stack frame on the first call */
+    size_t          seen;  /* callbacks so far */
+};
+
+/* Does the most the rb_foreach contract allows from inside the walk. Its
+ * stack frame must sit at the same address on every call: a recursive
+ * rb_foreach would call it from a depth that varies with the node. */
+static void legal_hostile(const char *key, void *value, void *ctx)
+{
+    struct hostile_walk *w = ctx;
+    (void)key;
+    (void)value;
+
+    void *frame = __builtin_frame_address(0);
+    if (w->seen == 0) {
+        w->frame = frame;
+    }
+    assert(frame == w->frame);
+
+    int inner = 0;
+    rb_foreach(w->t, count_calls, &inner);
+    assert((size_t)inner == rb_size(w->t));
+
+    w->seen++;
+}
+
+/* Keys in order before, rb_foreach, keys in order after: they must agree,
+ * down to the same key and value allocations in the same positions. */
+static void test_foreach_restoration(void)
+{
+    static int vals[N_RESTORE];
+    static struct key_list a, b; /* static: too big to want on the stack */
+    char key[KEY_CAP];
+    long live_before = fault_alloc_live();
+
+    a.n = 0; /* the battery runs this test once per kind of tree */
+    b.n = 0;
+
+    rbtree_t *t = create_tree(NULL);
+    assert(t != NULL);
+
+    /* scrambled insertion order; 37 is coprime to 128, so j takes every
+     * value in [0, 128) exactly once */
+    for (int i = 0; i < N_RESTORE; i++) {
+        int j = (i * 37) % N_RESTORE;
+        make_key(key, j);
+        vals[j] = j;
+        assert(rb_insert(t, key, &vals[j]) == 0);
+    }
+    /* delete every third key, so delete fixups have shaped the tree too */
+    for (int i = 0; i < N_RESTORE; i += 3) {
+        make_key(key, i);
+        assert(rb_delete(t, key) == 0);
+    }
+    assert(rb_validate(t) == 0);
+
+    /* before: must be exactly the keys left in, not just self-consistent */
+    rb_foreach(t, collect_keys, &a);
+    size_t n = 0;
+    /* invariant: a's first n entries are the surviving keys below i */
+    for (int i = 0; i < N_RESTORE; i++) {
+        if (i % 3 == 0) {
+            continue;
+        }
+        make_key(key, i);
+        assert(n < a.n);
+        assert(strcmp(a.text[n], key) == 0);
+        assert(a.value[n] == &vals[i]);
+        n++;
+    }
+    assert(a.n == n);
+    assert(rb_size(t) == n);
+
+    /* the walk under test, with a callback that reaches back into the tree */
+    struct hostile_walk w = { t, NULL, 0 };
+    long total_before = fault_alloc_total();
+    rb_foreach(t, legal_hostile, &w);
+    assert(fault_alloc_total() == total_before); /* no allocation at all */
+    assert(w.seen == n);
+
+    /* after */
+    rb_foreach(t, collect_keys, &b);
+    assert(b.n == a.n);
+    for (size_t i = 0; i < a.n; i++) {
+        assert(b.key[i] == a.key[i]); /* same allocation, not just equal */
+        assert(strcmp(b.text[i], a.text[i]) == 0);
+        assert(b.value[i] == a.value[i]);
+    }
+
+    assert(rb_validate(t) == 0);
+    assert(rb_size(t) == n);
+    for (size_t i = 0; i < a.n; i++) {
+        assert(rb_find(t, a.text[i]) == a.value[i]);
+    }
+
+    rb_destroy(t);
+    assert(fault_alloc_live() == live_before);
+}
+
 /* fault_alloc_total() value at which the armed fault fires */
 static long fire_at;
 
@@ -1226,6 +1348,7 @@ static void test_tree_battery(long expect_faulted)
 
     test_delete_cases();
     test_foreach_reentrant();
+    test_foreach_restoration();
     test_empty_tree();
     test_single_node();
     test_overwrite_only_key();
