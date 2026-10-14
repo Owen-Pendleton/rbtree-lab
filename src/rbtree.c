@@ -1,10 +1,14 @@
 #include "rbtree.h"
 #include "pool.h"
-#include "../tests/fault_alloc.h"
 
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Allocation seam (same declarations as tests/fault_alloc.h), repeated
+ * here so src/ builds without the tests/ directory. */
+void *rb_malloc(size_t n);
+void rb_free(void *p);
 
 typedef enum { RB_BLACK = 0, RB_RED = 1 } rb_color_t;
 

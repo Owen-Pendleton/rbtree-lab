@@ -1,9 +1,13 @@
 #include "pool.h"
-#include "../tests/fault_alloc.h"
 
 #include <assert.h>
 #include <stddef.h>
 #include <string.h>
+
+/* Allocation seam (same declarations as tests/fault_alloc.h), repeated
+ * here so src/ builds without the tests/ directory. */
+void *rb_malloc(size_t n);
+void rb_free(void *p);
 
 /* In-band slab header: sits at offset 0 of every 4096-byte slab. */
 struct pool_slab {
